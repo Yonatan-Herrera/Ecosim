@@ -1,3 +1,4 @@
+
 import Chart from 'chart.js/auto'
 
 (async function() {
@@ -10,11 +11,40 @@ import Chart from 'chart.js/auto'
     { year: 2015, count: 30 },
     { year: 2016, count: 28 },
   ];
-
+/*
   new Chart(
     document.getElementById('acquisitions'),
     {
       type: 'bar',
+      data: {
+        labels: data.map(row => row.year),
+        datasets: [
+          {
+            label: 'Acquisitions by year',
+            data: data.map(row => row.count)
+          }
+        ]
+      }
+    }
+  );
+
+*/
+
+ new Chart(
+    document.getElementById('acquisitions'),
+    {
+      type: 'bar',
+      options: {
+        animation: false,
+        plugins: {
+          legend: {
+            display: true
+          },
+          tooltip: {
+            enabled: true
+          }
+        }
+      },
       data: {
         labels: data.map(row => row.year),
         datasets: [
