@@ -1,0 +1,21 @@
+{
+  "simulation_info": {
+    "num_ticks": 200,
+    "num_households": 50,
+    "num_firms_initial": 7,
+    "num_firms_final": 8
+  },
+  "final_state": {
+    "unemployment_rate": 0.38,
+    "mean_wage": 73.72417300078648,
+    "mean_happiness": 0.6312599999999986,
+    "mean_morale": 0.5946,
+    "mean_health": 1.0,
+    "government_cash": -28004.286736174843
+  },
+  "database_stats": {
+    "households_rows": 10000,
+    "firms_rows": 1330,
+    "government_rows": 200
+  }
+}
