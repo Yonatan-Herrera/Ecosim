@@ -8,8 +8,12 @@ Progress is printed every 10 ticks to monitor performance and economic indicator
 import json
 import sqlite3
 import time
+from collections import deque
 from pathlib import Path
-from typing import List
+from typing import Dict, List
+
+import numpy as np
+
 from agents import HouseholdAgent, FirmAgent, GovernmentAgent
 from economy import Economy
 
@@ -236,9 +240,53 @@ def init_database(db_path: str):
     conn.close()
 
 
-def export_tick_data(economy: Economy, tick: int, db_path: str):
-    """Export current tick data to database."""
-    conn = sqlite3.connect(db_path)
+def compute_household_stats(households: List[HouseholdAgent]) -> Dict[str, float]:
+    """Vectorized snapshot of household metrics for reuse."""
+    if not households:
+        return {
+            "unemployment_rate": 0.0,
+            "mean_wage": 0.0,
+            "median_wage": 0.0,
+            "mean_cash": 0.0,
+            "median_cash": 0.0,
+            "mean_happiness": 0.0,
+            "mean_morale": 0.0,
+            "mean_health": 0.0,
+            "mean_performance": 0.0
+        }
+
+    cash = np.array([h.cash_balance for h in households], dtype=float)
+    happiness = np.array([h.happiness for h in households], dtype=float)
+    morale = np.array([h.morale for h in households], dtype=float)
+    health = np.array([h.health for h in households], dtype=float)
+    performance = np.array([h.get_performance_multiplier() for h in households], dtype=float)
+    employment = np.array([1.0 if h.is_employed else 0.0 for h in households], dtype=float)
+    employed_wages = np.array([h.wage for h in households if h.is_employed], dtype=float)
+
+    unemployment_rate = 1.0 - (employment.mean() if employment.size else 0.0)
+    mean_wage = float(employed_wages.mean()) if employed_wages.size else 0.0
+    median_wage = float(np.median(employed_wages)) if employed_wages.size else 0.0
+
+    return {
+        "unemployment_rate": unemployment_rate,
+        "mean_wage": mean_wage,
+        "median_wage": median_wage,
+        "mean_cash": float(cash.mean()),
+        "median_cash": float(np.median(cash)),
+        "mean_happiness": float(happiness.mean()),
+        "mean_morale": float(morale.mean()),
+        "mean_health": float(health.mean()),
+        "mean_performance": float(performance.mean())
+    }
+
+
+def export_tick_data(
+    economy: Economy,
+    tick: int,
+    conn: sqlite3.Connection,
+    household_stats: Dict[str, float] | None = None
+):
+    """Export current tick data using an open database connection."""
     cursor = conn.cursor()
 
     # Export households
@@ -309,9 +357,9 @@ def export_tick_data(economy: Economy, tick: int, db_path: str):
     )
 
     # Calculate and export aggregate metrics
-    unemployed = sum(1 for h in economy.households if not h.is_employed)
-    employed_wages = [h.wage for h in economy.households if h.is_employed]
-    all_cash = [h.cash_balance for h in economy.households]
+    stats = household_stats or compute_household_stats(economy.households)
+    total_firm_cash = sum(f.cash_balance for f in economy.firms)
+    mean_price = sum(f.price for f in economy.firms) / len(economy.firms) if economy.firms else 0.0
 
     cursor.execute(
         "INSERT INTO aggregate_metrics VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -319,23 +367,22 @@ def export_tick_data(economy: Economy, tick: int, db_path: str):
             tick,
             len(economy.households),
             len(economy.firms),
-            unemployed / len(economy.households),
-            sum(employed_wages) / len(employed_wages) if employed_wages else 0.0,
-            sorted(employed_wages)[len(employed_wages)//2] if employed_wages else 0.0,
-            sum(all_cash) / len(all_cash),
-            sorted(all_cash)[len(all_cash)//2],
-            sum(h.happiness for h in economy.households) / len(economy.households),
-            sum(h.morale for h in economy.households) / len(economy.households),
-            sum(h.health for h in economy.households) / len(economy.households),
-            sum(h.get_performance_multiplier() for h in economy.households) / len(economy.households),
-            sum(f.cash_balance for f in economy.firms),
-            sum(f.price for f in economy.firms) / len(economy.firms),
+            stats["unemployment_rate"],
+            stats["mean_wage"],
+            stats["median_wage"],
+            stats["mean_cash"],
+            stats["median_cash"],
+            stats["mean_happiness"],
+            stats["mean_morale"],
+            stats["mean_health"],
+            stats["mean_performance"],
+            total_firm_cash,
+            mean_price,
             gov.cash_balance
         )
     )
 
     conn.commit()
-    conn.close()
 
 
 def main():
@@ -371,6 +418,9 @@ def main():
     init_database(str(db_path))
     print()
 
+    # Prepare persistent DB connection
+    db_conn = sqlite3.connect(str(db_path))
+
     # Run simulation
     print(f"Running simulation for {NUM_TICKS} ticks...")
     print(f"(Exporting to database every {EXPORT_EVERY_N_TICKS} ticks)")
@@ -378,7 +428,8 @@ def main():
     print("Tick | Time(s) | Firms | Unemploy |   Happiness | Avg Wage | Gov Cash")
     print("-" * 80)
 
-    tick_times = []
+    tick_time_history: deque[float] = deque(maxlen=10)
+    tick_time_sum = 0.0
 
     for tick in range(NUM_TICKS):
         tick_start = time.time()
@@ -387,28 +438,27 @@ def main():
         economy.step()
 
         tick_time = time.time() - tick_start
-        tick_times.append(tick_time)
+        tick_time_history.append(tick_time)
+        tick_time_sum += tick_time
+        household_stats = compute_household_stats(economy.households)
 
         # Export data periodically
         if tick % EXPORT_EVERY_N_TICKS == 0 or tick == NUM_TICKS - 1:
-            export_tick_data(economy, tick, str(db_path))
+            export_tick_data(economy, tick, db_conn, household_stats)
 
         # Print progress every 10 ticks
         if tick % 10 == 0 or tick == NUM_TICKS - 1:
-            unemployed = sum(1 for h in economy.households if not h.is_employed)
-            unemployment_rate = unemployed / len(economy.households)
-            avg_happiness = sum(h.happiness for h in economy.households) / len(economy.households)
-            employed_wages = [h.wage for h in economy.households if h.is_employed]
-            avg_wage = sum(employed_wages) / len(employed_wages) if employed_wages else 0.0
-            avg_tick_time = sum(tick_times[-10:]) / min(10, len(tick_times))
+            avg_tick_time = sum(tick_time_history) / len(tick_time_history)
 
             print(f"{tick:4d} | {avg_tick_time:7.3f} | {len(economy.firms):5d} | "
-                  f"{unemployment_rate:7.1%} | {avg_happiness:11.3f} | "
-                  f"${avg_wage:7.2f} | ${economy.government.cash_balance:9.0f}")
+                  f"{household_stats['unemployment_rate']:7.1%} | {household_stats['mean_happiness']:11.3f} | "
+                  f"${household_stats['mean_wage']:7.2f} | ${economy.government.cash_balance:9.0f}")
 
     print()
     total_time = time.time() - start_time
-    avg_tick_time = sum(tick_times) / len(tick_times)
+    avg_tick_time = tick_time_sum / NUM_TICKS
+
+    db_conn.close()
 
     print(f"✓ Simulation complete!")
     print(f"  Total time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
@@ -469,8 +519,11 @@ def main():
 
     conn.close()
 
-    # Save summary
+    # Save summary (remove existing file to avoid stale content)
     summary_path = output_dir / "simulation_10k_balanced_summary.json"
+    if summary_path.exists():
+        summary_path.unlink()
+        print(f"Removed existing summary: {summary_path}")
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
 
