@@ -362,8 +362,11 @@ def main():
     print(f"Economy creation time: {creation_time:.2f} seconds")
     print()
 
-    # Initialize database
+    # Initialize database (remove existing file if present)
     db_path = output_dir / "ecosim_10k_balanced.db"
+    if db_path.exists():
+        db_path.unlink()  # Delete existing database
+        print(f"Removed existing database: {db_path}")
     print(f"Initializing database: {db_path}")
     init_database(str(db_path))
     print()
