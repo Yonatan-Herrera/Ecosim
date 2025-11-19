@@ -176,10 +176,17 @@ class Economy:
             sales_data = per_firm_sales.get(firm.firm_id, {"units_sold": 0.0, "revenue": 0.0})
             profit_tax = tax_plan["profit_taxes"].get(firm.firm_id, 0.0)
 
+            # Get price ceiling tax from firm snapshots
+            price_ceiling_tax = 0.0
+            for snapshot in firm_tax_snapshots:
+                if snapshot["firm_id"] == firm.firm_id:
+                    price_ceiling_tax = snapshot.get("price_ceiling_tax", 0.0)
+                    break
+
             firm.apply_sales_and_profit({
                 "units_sold": sales_data["units_sold"],
                 "revenue": sales_data["revenue"],
-                "profit_taxes_paid": profit_tax
+                "profit_taxes_paid": profit_tax + price_ceiling_tax
             })
 
             # Apply price and wage updates
@@ -214,11 +221,12 @@ class Economy:
         # Phase 11: Apply government fiscal results
         total_wage_taxes = sum(tax_plan["wage_taxes"].values())
         total_profit_taxes = sum(tax_plan["profit_taxes"].values())
+        total_price_ceiling_taxes = sum(snapshot.get("price_ceiling_tax", 0.0) for snapshot in firm_tax_snapshots)
         total_transfers = sum(transfer_plan.values())
 
         self.government.apply_fiscal_results(
             total_wage_taxes,
-            total_profit_taxes,
+            total_profit_taxes + total_price_ceiling_taxes,  # Include price ceiling tax as profit tax
             total_transfers
         )
 
@@ -563,23 +571,35 @@ class Economy:
             per_firm_sales: Sales data from goods market clearing
 
         Returns:
-            List of dicts with firm_id and profit_before_tax
+            List of dicts with firm_id, profit_before_tax, and price_ceiling_tax
         """
         snapshots = []
+        PRICE_CEILING = 50.0  # Price ceiling threshold
+        PRICE_CEILING_TAX_RATE = 0.25  # 25% tax on revenue from sales above ceiling
+
         for firm in self.firms:
-            sales_data = per_firm_sales.get(firm.firm_id, {"revenue": 0.0})
+            sales_data = per_firm_sales.get(firm.firm_id, {"revenue": 0.0, "units_sold": 0.0})
             revenue = sales_data["revenue"]
+            units_sold = sales_data["units_sold"]
+
+            # Calculate price ceiling tax
+            # If price > $50, firm pays 25% tax on the revenue from those sales
+            price_ceiling_tax = 0.0
+            if firm.price > PRICE_CEILING and units_sold > 0:
+                # Tax applies to revenue from sales above the ceiling
+                price_ceiling_tax = revenue * PRICE_CEILING_TAX_RATE
 
             # Compute costs
             wage_bill = sum(firm.actual_wages.get(e_id, firm.wage_offer) for e_id in firm.employees)
             # Note: Other variable costs would be included here if tracked
 
-            # Profit = revenue - wage_bill (simplified)
-            profit_before_tax = revenue - wage_bill
+            # Profit = revenue - wage_bill - price_ceiling_tax (simplified)
+            profit_before_tax = revenue - wage_bill - price_ceiling_tax
 
             snapshots.append({
                 "firm_id": firm.firm_id,
-                "profit_before_tax": profit_before_tax
+                "profit_before_tax": profit_before_tax,
+                "price_ceiling_tax": price_ceiling_tax
             })
         return snapshots
 
