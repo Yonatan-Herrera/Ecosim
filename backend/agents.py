@@ -47,8 +47,8 @@ class HouseholdAgent:
 
     # Expectations and beliefs
     price_beliefs: Dict[str, float] = field(default_factory=dict)
-    expected_wage: float = 50.0  # initial default wage expectation
-    reservation_wage: float = 40.0  # minimum acceptable wage
+    expected_wage: float = 10.0  # initial default wage expectation
+    reservation_wage: float = 8.0  # minimum acceptable wage
     #wage_increase: float=5*ticks
 
     # Config / tuning parameters
@@ -892,7 +892,7 @@ class FirmAgent:
         import math
         
 
-        current_workers = len(self.employees)+len(self.employers_id)
+        current_workers = len(self.employees) #+len(self.employers_id)
         planned_hires = 0
         planned_layoffs: List[int] = []
 
