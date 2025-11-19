@@ -1473,7 +1473,13 @@ class GovernmentAgent:
 
             # Each $500 invested increases quality by 0.5%
             quality_gain = (investment / 500.0) * 0.005
-            self.technology_quality_multiplier += quality_gain
+
+            # Cap quality multiplier at 1.05 (max 5% quality improvement)
+            # This prevents quality from reaching 10.0 (perfection)
+            self.technology_quality_multiplier = min(
+                1.05,
+                self.technology_quality_multiplier + quality_gain
+            )
 
             return investment
         return 0.0
