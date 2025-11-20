@@ -395,7 +395,7 @@ def main():
     # Configuration
     NUM_HOUSEHOLDS = 10000
     NUM_FIRMS_PER_CATEGORY = 10
-    NUM_TICKS = 50  # Run for 500 ticks to see dynamics
+    NUM_TICKS = 500  # Run for 500 ticks to see dynamics
     EXPORT_EVERY_N_TICKS = 10  # Export to DB every 10 ticks
 
     # Create output directory

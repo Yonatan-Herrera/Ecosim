@@ -4,21 +4,21 @@
     "num_households": 10000,
     "num_firms_initial": 33,
     "num_firms_final": 33,
-    "total_simulation_time_seconds": 87.60686993598938,
-    "average_tick_time_seconds": 1.7107282590866089
+    "total_simulation_time_seconds": 88.305340051651,
+    "average_tick_time_seconds": 1.7330651378631592
   },
   "final_state": {
     "tick": 49,
-    "unemployment_rate": 0.9537,
-    "mean_wage": 93.44914930571149,
-    "median_wage": 83.68084719297731,
-    "mean_household_cash": 252.18102099551953,
-    "median_household_cash": 218.45075486597358,
-    "mean_happiness": 0.022898574999999744,
-    "mean_morale": 0.015417600007584579,
-    "mean_health": 0.18425856500000434,
-    "government_cash": 17671565.908352714,
-    "total_firm_cash": 52119123.881692216
+    "unemployment_rate": 0.9463,
+    "mean_wage": 91.58971222520967,
+    "median_wage": 83.0001522229388,
+    "mean_household_cash": 249.87640380282738,
+    "median_household_cash": 214.89108404259025,
+    "mean_happiness": 0.02523379999999972,
+    "mean_morale": 0.02108200000000002,
+    "mean_health": 0.1997445300000021,
+    "government_cash": 17738653.911100373,
+    "total_firm_cash": 52075082.050871484
   },
   "database_stats": {
     "households_rows": 60000,
@@ -30,13 +30,13 @@
       0
     ],
     "unemployment_rate": [
-      0.9973
+      0.9955
     ],
     "mean_wage": [
-      78.70380722222224
+      70.86554716666666
     ],
     "mean_happiness": [
-      0.6432850000001024
+      0.6433750000001011
     ]
   }
 }
