@@ -68,7 +68,7 @@ def test_firm_behavior_52_ticks():
             good_category="Food",
             quality_level=5.0,
             wage_offer=50.0,
-            price=10.0,
+            price=1.0,
             expected_sales_units=200.0,
             production_capacity_units=1000.0,
             productivity_per_worker=15.0

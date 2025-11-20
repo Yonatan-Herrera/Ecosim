@@ -43,9 +43,9 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
     )
 
     baseline_prices = {
-        "Food": 5.0,
-        "Housing": 15.0,
-        "Services": 7.0,
+        "Food": 0.5,
+        "Housing": 150.0,
+        "Services": 35.0,
     }
 
     # Create firms
@@ -395,7 +395,7 @@ def main():
     # Configuration
     NUM_HOUSEHOLDS = 10000
     NUM_FIRMS_PER_CATEGORY = 10
-    NUM_TICKS = 500  # Run for 500 ticks to see dynamics
+    NUM_TICKS = 200  # Run for 500 ticks to see dynamics
     EXPORT_EVERY_N_TICKS = 10  # Export to DB every 10 ticks
 
     # Create output directory
