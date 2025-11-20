@@ -12,7 +12,12 @@ EcoSim is a deterministic economic simulation that models households, firms, and
    ```bash
    pip install -r requirements.txt
    ```
-3. **Run a simulation**
+3. **Populate the sample database (optional for analysis dashboards)**
+   ```bash
+   python backend/generate_sample_data.py
+   ```
+   This script creates `backend/sample_data/ecosim_sample.db` so notebooks and dashboards can run without waiting on a large simulation.
+4. **Run a simulation**
    ```bash
    python backend/demo_skill_experience.py
    ```

@@ -29,7 +29,7 @@ class HouseholdAgent:
     goods_inventory: Dict[str, float] = field(default_factory=dict)
     employer_id: Optional[int] = None
     wage: float = 0.0
-
+    ticks: int=1
     # Preferences and heuristics
     consumption_budget_share: float = 0.7  # Legacy field (overridden by savings_rate_target if set)
     good_weights: Dict[str, float] = field(default_factory=dict)  # DEPRECATED: use category_weights
@@ -47,8 +47,9 @@ class HouseholdAgent:
 
     # Expectations and beliefs
     price_beliefs: Dict[str, float] = field(default_factory=dict)
-    expected_wage: float = 50.0  # initial default wage expectation
-    reservation_wage: float = 40.0  # minimum acceptable wage
+    expected_wage: float = 10.0  # initial default wage expectation
+    reservation_wage: float = 8.0  # minimum acceptable wage
+    #wage_increase: float=5*ticks
 
     # Config / tuning parameters
     price_expectation_alpha: float = 0.3  # [0,1] for price smoothing
@@ -851,6 +852,7 @@ class FirmAgent:
             "cash_balance": self.cash_balance,
             "inventory_units": self.inventory_units,
             "employees": list(self.employees),
+            "employers":list(self.employers),
             "expected_sales_units": self.expected_sales_units,
             "production_capacity_units": self.production_capacity_units,
             "productivity_per_worker": self.productivity_per_worker,
@@ -964,8 +966,9 @@ class FirmAgent:
         )
 
         import math
+        
 
-        current_workers = len(self.employees)
+        current_workers = len(self.employees) #+len(self.employers_id)
         planned_hires = 0
         planned_layoffs: List[int] = []
 

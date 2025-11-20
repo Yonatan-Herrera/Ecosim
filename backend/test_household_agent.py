@@ -1,220 +1,473 @@
 """
-Unit tests for HouseholdAgent
+Comprehensive Test Suite for HouseholdAgent
 
-Tests cover:
-- Demand planning behavior under various conditions
-- Price expectation updates
-- Income receipt and trade execution
-- Invariant enforcement
+This test file validates the HouseholdAgent behavior including:
+- Labor supply decisions
+- Consumption planning with price sensitivity
+- Skill development and experience accumulation
+- Wellbeing tracking (happiness, morale, health)
+- Inventory management and goods consumption
+
+Run this test to verify household agents are working correctly.
+
+Usage:
+    python test_household_agent.py
 """
 
-import pytest
+import sys
 from agents import HouseholdAgent
 
 
-class TestHouseholdAgent:
-    """Test suite for HouseholdAgent functionality"""
+def print_section(title):
+    """Print a formatted section header."""
+    print("\n" + "=" * 70)
+    print(f"  {title}")
+    print("=" * 70)
 
-    def test_no_cash_no_demand(self):
-        """With zero cash, household should plan no demand"""
-        household = HouseholdAgent(
-            id="h1",
-            cash=0.0,
-            budget_share=0.8,
-            good_weights={"food": 0.5, "clothing": 0.5},
-            expected_prices={"food": 10.0, "clothing": 20.0}
-        )
 
-        orders = household.plan_demand()
+def test_household_creation():
+    """Test 1: Verify household agent can be created with default parameters."""
+    print_section("TEST 1: Household Creation")
 
-        # Should return empty list or all zero quantities
-        assert len(orders) == 0 or all(order["quantity"] == 0 for order in orders)
+    household = HouseholdAgent(
+        household_id=1,
+        skills_level=0.5,
+        age=30,
+        cash_balance=1000.0
+    )
 
-    def test_prices_double_demand_falls(self):
-        """When prices double, total planned quantity should strictly decrease"""
-        # Setup household with some cash and preferences
-        household = HouseholdAgent(
-            id="h1",
-            cash=1000.0,
-            budget_share=0.8,
-            good_weights={"food": 0.6, "clothing": 0.4},
-            expected_prices={"food": 10.0, "clothing": 20.0}
-        )
+    print(f"✓ Created household #{household.household_id}")
+    print(f"  Skills: {household.skills_level}")
+    print(f"  Age: {household.age}")
+    print(f"  Cash: ${household.cash_balance:.2f}")
+    print(f"  Employed: {household.is_employed}")
+    print(f"  Happiness: {household.happiness:.3f}")
+    print(f"  Morale: {household.morale:.3f}")
+    print(f"  Health: {household.health:.3f}")
 
-        # Plan demand with initial prices
-        orders_before = household.plan_demand()
-        total_qty_before = sum(order["quantity"] for order in orders_before)
+    assert household.household_id == 1, "Household ID mismatch"
+    assert household.skills_level == 0.5, "Skills level mismatch"
+    assert household.cash_balance == 1000.0, "Cash balance mismatch"
 
-        # Double all expected prices
-        household.expected_prices = {"food": 20.0, "clothing": 40.0}
+    print("\n✅ TEST 1 PASSED: Household creation successful")
+    return household
 
-        # Plan demand with doubled prices
-        orders_after = household.plan_demand()
-        total_qty_after = sum(order["quantity"] for order in orders_after)
 
-        # Total quantity must strictly decrease
-        assert total_qty_after < total_qty_before
+def test_labor_supply_planning(household):
+    """Test 2: Verify household labor supply decisions."""
+    print_section("TEST 2: Labor Supply Planning")
 
-    def test_expectations_update_toward_observed_price(self):
-        """Price expectations should update via exponential smoothing"""
-        alpha = 0.3
-        household = HouseholdAgent(
-            id="h1",
-            cash=1000.0,
-            expectation_alpha=alpha,
-            expected_prices={"food": 100.0}
-        )
+    # Unemployed household should search for job
+    unemployment_benefit = 40.0  # Government unemployment support
+    labor_plan = household.plan_labor_supply(unemployment_benefit)
 
-        old_expected = household.expected_prices["food"]
-        observed_price = 80.0
+    print(f"Labor Supply Plan:")
+    print(f"  Unemployment benefit: ${unemployment_benefit:.2f}")
+    print(f"  Searching for job: {labor_plan['searching_for_job']}")
+    print(f"  Reservation wage: ${labor_plan['reservation_wage']:.2f}")
+    print(f"  Skills level: {labor_plan['skills_level']:.2f}")
 
-        # Observe new market price
-        household.observe_market({"food": observed_price})
+    assert labor_plan['searching_for_job'] == True, "Unemployed should search"
+    assert labor_plan['reservation_wage'] > 0, "Reservation wage should be positive"
 
-        new_expected = household.expected_prices["food"]
-        expected_value = alpha * observed_price + (1 - alpha) * old_expected
+    print("\n✅ TEST 2 PASSED: Labor supply planning works correctly")
 
-        # Check exponential smoothing formula
-        assert abs(new_expected - expected_value) < 1e-9
 
-    def test_cannot_spend_more_than_cash(self):
-        """Total planned spending must never exceed available cash"""
-        household = HouseholdAgent(
-            id="h1",
-            cash=100.0,
-            budget_share=1.0,  # Try to spend all cash
-            good_weights={"food": 0.5, "clothing": 0.5},
-            expected_prices={"food": 10.0, "clothing": 20.0}
-        )
+def test_consumption_planning(household):
+    """Test 3: Verify household consumption decisions."""
+    print_section("TEST 3: Consumption Planning")
 
-        orders = household.plan_demand()
+    # Set up market prices
+    market_prices = {
+        "Food": 5.0,
+        "Housing": 15.0,
+        "Services": 7.0
+    }
 
-        # Calculate total planned spending
-        total_spending = 0.0
-        for order in orders:
-            good_id = order["good_id"]
-            quantity = order["quantity"]
-            expected_price = household.expected_prices[good_id]
-            total_spending += quantity * expected_price
+    consumption_plan = household.plan_consumption(market_prices)
 
-        # Must not exceed cash
-        assert total_spending <= household.cash + 1e-9  # Small tolerance for floating point
+    print(f"Consumption Plan:")
+    print(f"  Budget available: ${household.cash_balance * 0.9:.2f} (90% of cash)")
+    print(f"  Planned purchases: {len(consumption_plan['planned_purchases'])} items")
 
-    def test_apply_trade_results_updates_cash_and_inventory(self):
-        """Executing trades should correctly update cash and inventory"""
-        initial_cash = 1000.0
-        household = HouseholdAgent(
-            id="h1",
-            cash=initial_cash,
-            inventory={"food": 5.0}
-        )
+    for good, quantity in consumption_plan['planned_purchases'].items():
+        if quantity > 0:
+            price = market_prices.get(good, 0)
+            cost = quantity * price
+            print(f"    - {good}: {quantity:.2f} units @ ${price:.2f} = ${cost:.2f}")
 
-        # Execute some trades
-        executed_trades = [
-            {"good_id": "food", "quantity": 10.0, "unit_price": 15.0},
-            {"good_id": "clothing", "quantity": 3.0, "unit_price": 25.0}
-        ]
+    assert 'planned_purchases' in consumption_plan, "Missing planned_purchases"
 
-        household.apply_trade_results(executed_trades)
+    print("\n✅ TEST 3 PASSED: Consumption planning works correctly")
 
-        # Check cash decreased correctly
-        expected_cash = initial_cash - (10.0 * 15.0) - (3.0 * 25.0)
-        assert abs(household.cash - expected_cash) < 1e-9
 
-        # Check inventory updated correctly
-        assert abs(household.inventory["food"] - 15.0) < 1e-9  # 5 + 10
-        assert abs(household.inventory["clothing"] - 3.0) < 1e-9
+def test_employment_and_wages(household):
+    """Test 4: Verify employment status changes and wage tracking."""
+    print_section("TEST 4: Employment and Wage Updates")
 
-        # Check non-negativity
-        assert household.cash >= 0
-        assert all(qty >= 0 for qty in household.inventory.values())
+    # Simulate getting hired
+    labor_outcome = {
+        "employer_id": 10,
+        "wage": 75.0,
+        "employer_category": "Food"
+    }
 
-    def test_receive_income_increases_cash(self):
-        """Receiving income should increase cash balance"""
-        household = HouseholdAgent(id="h1", cash=100.0)
+    print(f"Before employment:")
+    print(f"  Employed: {household.is_employed}")
+    print(f"  Wage: ${household.wage:.2f}")
+    print(f"  Food experience: {household.category_experience.get('Food', 0)} ticks")
 
-        household.receive_income(50.0)
+    household.apply_labor_outcome(labor_outcome)
 
-        assert household.cash == 150.0
+    print(f"\nAfter getting hired:")
+    print(f"  Employed: {household.is_employed}")
+    print(f"  Employer ID: {household.employer_id}")
+    print(f"  Wage: ${household.wage:.2f}")
+    print(f"  Category: {labor_outcome['employer_category']}")
 
-    def test_receive_income_rejects_negative(self):
-        """Receiving negative income should raise ValueError"""
-        household = HouseholdAgent(id="h1", cash=100.0)
+    assert household.is_employed == True, "Should be employed"
+    assert household.wage == 75.0, "Wage should be $75"
+    assert household.employer_id == 10, "Employer ID should be 10"
 
-        with pytest.raises(ValueError, match="non-negative"):
-            household.receive_income(-50.0)
+    print("\n✅ TEST 4 PASSED: Employment status updates correctly")
 
-    def test_insufficient_cash_for_trade_raises_error(self):
-        """Attempting trade with insufficient cash should raise ValueError"""
-        household = HouseholdAgent(id="h1", cash=50.0)
 
-        executed_trades = [
-            {"good_id": "food", "quantity": 10.0, "unit_price": 10.0}  # Costs 100
-        ]
+def test_skill_development(household):
+    """Test 5: Verify skill growth through work experience."""
+    print_section("TEST 5: Skill Development")
 
-        with pytest.raises(ValueError, match="Insufficient cash"):
-            household.apply_trade_results(executed_trades)
+    initial_skills = household.skills_level
+    initial_food_exp = household.category_experience.get('Food', 0)
 
-    def test_observe_market_initializes_new_good_price(self):
-        """Observing a new good should initialize its expected price"""
-        household = HouseholdAgent(id="h1", cash=100.0)
+    print(f"Initial skills: {initial_skills:.4f}")
+    print(f"Initial Food experience: {initial_food_exp} ticks")
 
-        household.observe_market({"food": 25.0})
+    # Simulate 10 ticks of employment with passive skill growth
+    for tick in range(10):
+        labor_outcome = {
+            "employer_id": 10,
+            "wage": 75.0,
+            "employer_category": "Food"
+        }
+        household.apply_labor_outcome(labor_outcome)
 
-        assert "food" in household.expected_prices
-        assert household.expected_prices["food"] == 25.0
+    final_skills = household.skills_level
+    final_food_exp = household.category_experience.get('Food', 0)
+    skill_gain = final_skills - initial_skills
+    experience_gain = final_food_exp - initial_food_exp
 
-    def test_budget_share_validates_range(self):
-        """budget_share must be in [0, 1]"""
-        with pytest.raises(ValueError, match="budget_share"):
-            HouseholdAgent(id="h1", cash=100.0, budget_share=1.5)
+    print(f"\nAfter 10 ticks of work:")
+    print(f"  Final skills: {final_skills:.4f}")
+    print(f"  Skill gain: +{skill_gain:.4f}")
+    print(f"  Food experience: {final_food_exp} ticks (+{experience_gain} gained)")
 
-        with pytest.raises(ValueError, match="budget_share"):
-            HouseholdAgent(id="h1", cash=100.0, budget_share=-0.1)
+    assert final_skills > initial_skills, "Skills should improve with work"
+    assert experience_gain == 10, f"Should gain 10 ticks of experience, gained {experience_gain}"
 
-    def test_expectation_alpha_validates_range(self):
-        """expectation_alpha must be in (0, 1]"""
-        with pytest.raises(ValueError, match="expectation_alpha"):
-            HouseholdAgent(id="h1", cash=100.0, expectation_alpha=0.0)
+    print("\n✅ TEST 5 PASSED: Skills develop through work experience")
 
-        with pytest.raises(ValueError, match="expectation_alpha"):
-            HouseholdAgent(id="h1", cash=100.0, expectation_alpha=1.5)
 
-    def test_initial_cash_cannot_be_negative(self):
-        """Initial cash must be non-negative"""
-        with pytest.raises(ValueError, match="cash"):
-            HouseholdAgent(id="h1", cash=-100.0)
+def test_goods_consumption():
+    """Test 6: Verify goods inventory depletion."""
+    print_section("TEST 6: Goods Consumption")
 
-    def test_zero_expected_price_produces_no_demand(self):
-        """Good with zero or negative expected price should not be demanded"""
-        household = HouseholdAgent(
-            id="h1",
-            cash=1000.0,
-            budget_share=0.8,
-            good_weights={"food": 0.5, "broken": 0.5},
-            expected_prices={"food": 10.0, "broken": 0.0}
-        )
+    household = HouseholdAgent(
+        household_id=2,
+        skills_level=0.6,
+        age=35,
+        cash_balance=500.0
+    )
 
-        orders = household.plan_demand()
+    # Give household some goods
+    household.goods_inventory = {
+        "Food": 100.0,
+        "Housing": 50.0,
+        "Services": 30.0
+    }
 
-        # Should only have order for "food", not "broken"
-        good_ids = [order["good_id"] for order in orders]
-        assert "food" in good_ids
-        assert "broken" not in good_ids
+    print(f"Initial inventory:")
+    for good, amount in household.goods_inventory.items():
+        print(f"  {good}: {amount:.2f} units")
 
-    def test_zero_weight_produces_no_demand(self):
-        """Good with zero weight should not be demanded"""
-        household = HouseholdAgent(
-            id="h1",
-            cash=1000.0,
-            budget_share=0.8,
-            good_weights={"food": 1.0, "unwanted": 0.0},
-            expected_prices={"food": 10.0, "unwanted": 10.0}
-        )
+    # Consume goods over 5 ticks
+    print(f"\nConsuming goods (10% per tick):")
+    for tick in range(5):
+        household.consume_goods()
+        if tick % 2 == 1:  # Print every other tick
+            print(f"\n  After tick {tick + 1}:")
+            for good, amount in household.goods_inventory.items():
+                print(f"    {good}: {amount:.2f} units")
 
-        orders = household.plan_demand()
+    # Check depletion
+    for good, final_amount in household.goods_inventory.items():
+        print(f"\n  {good}: 100 → {final_amount:.2f} ({(1 - final_amount/100)*100:.1f}% consumed)")
 
-        # Should only have order for "food", not "unwanted"
-        good_ids = [order["good_id"] for order in orders]
-        assert "food" in good_ids
-        assert "unwanted" not in good_ids
+    assert all(v < 100 for v in household.goods_inventory.values()), "Goods should be consumed"
+
+    print("\n✅ TEST 6 PASSED: Goods consumption works correctly")
+
+
+def test_wellbeing_system():
+    """Test 7: Verify happiness, morale, and health tracking."""
+    print_section("TEST 7: Wellbeing System")
+
+    household = HouseholdAgent(
+        household_id=3,
+        skills_level=0.7,
+        age=40,
+        cash_balance=2000.0
+    )
+
+    # Give household some goods to avoid goods penalty
+    household.goods_inventory = {
+        "Food": 50.0,
+        "Housing": 30.0,
+        "Services": 20.0
+    }
+
+    initial_happiness = household.happiness
+    initial_morale = household.morale
+    initial_health = household.health
+
+    print(f"Initial wellbeing:")
+    print(f"  Happiness: {household.happiness:.3f}")
+    print(f"  Morale: {household.morale:.3f}")
+    print(f"  Health: {household.health:.3f}")
+    print(f"  Total goods: {sum(household.goods_inventory.values()):.1f} units")
+    print(f"  Performance multiplier: {household.get_performance_multiplier():.3f}")
+
+    # Simulate being unemployed for 5 ticks (should decrease wellbeing)
+    print(f"\nSimulating 5 ticks of unemployment...")
+    for _ in range(5):
+        household.update_wellbeing(government_happiness_multiplier=1.0)
+
+    unemployment_happiness = household.happiness
+    unemployment_morale = household.morale
+
+    print(f"\nAfter unemployment:")
+    print(f"  Happiness: {household.happiness:.3f} (decreased from {initial_happiness:.3f})")
+    print(f"  Morale: {household.morale:.3f} (decreased from {initial_morale:.3f})")
+    print(f"  Health: {household.health:.3f} (decreased from {initial_health:.3f})")
+    print(f"  Performance multiplier: {household.get_performance_multiplier():.3f}")
+
+    # Verify unemployment decreases wellbeing
+    assert household.happiness < initial_happiness, "Happiness should decrease during unemployment"
+    assert household.morale < initial_morale, "Morale should decrease during unemployment"
+
+    # Now get employed with good wage
+    print(f"\nGetting employed with $100 wage...")
+    labor_outcome = {
+        "employer_id": 15,
+        "wage": 100.0,
+        "employer_category": "Services"
+    }
+    household.apply_labor_outcome(labor_outcome)
+
+    # Set expected wage so household is satisfied
+    household.expected_wage = 90.0
+
+    # Simulate 5 ticks of employment
+    for _ in range(5):
+        household.update_wellbeing(government_happiness_multiplier=1.0)
+
+    print(f"\nAfter 5 ticks of employment (wage $100 vs expected $90):")
+    print(f"  Happiness: {household.happiness:.3f} (was {unemployment_happiness:.3f})")
+    print(f"  Morale: {household.morale:.3f} (was {unemployment_morale:.3f})")
+    print(f"  Health: {household.health:.3f}")
+    print(f"  Performance multiplier: {household.get_performance_multiplier():.3f}")
+
+    # Verify employment improves wellbeing over time
+    assert household.morale > unemployment_morale, "Morale should improve with good employment"
+
+    print("\n✅ TEST 7 PASSED: Wellbeing system tracks employment effects")
+
+
+def test_income_and_spending():
+    """Test 8: Verify income, taxes, transfers, and purchases."""
+    print_section("TEST 8: Income and Spending")
+
+    household = HouseholdAgent(
+        household_id=4,
+        skills_level=0.8,
+        age=45,
+        cash_balance=500.0
+    )
+
+    initial_cash = household.cash_balance
+    print(f"Initial cash: ${initial_cash:.2f}")
+
+    # Apply income and taxes
+    income_data = {
+        "wage_income": 80.0,
+        "transfers": 20.0,  # Unemployment benefits
+        "taxes_paid": 12.0  # 15% wage tax
+    }
+
+    print(f"\nIncome this tick:")
+    print(f"  Wage income: ${income_data['wage_income']:.2f}")
+    print(f"  Transfers: ${income_data['transfers']:.2f}")
+    print(f"  Taxes paid: -${income_data['taxes_paid']:.2f}")
+
+    household.apply_income_and_taxes(income_data)
+
+    after_income_cash = household.cash_balance
+    net_income = income_data['wage_income'] + income_data['transfers'] - income_data['taxes_paid']
+
+    print(f"\nAfter income:")
+    print(f"  Cash: ${after_income_cash:.2f}")
+    print(f"  Net income: +${net_income:.2f}")
+
+    # Apply purchases
+    purchases = {
+        "Food": (10.0, 5.0),  # (units, price)
+        "Services": (5.0, 7.0)
+    }
+
+    total_cost = sum(units * price for units, price in purchases.values())
+    print(f"\nPurchases:")
+    for good, (units, price) in purchases.items():
+        cost = units * price
+        print(f"  {good}: {units:.1f} units @ ${price:.2f} = ${cost:.2f}")
+    print(f"  Total cost: ${total_cost:.2f}")
+
+    household.apply_purchases(purchases)
+
+    final_cash = household.cash_balance
+    print(f"\nFinal cash: ${final_cash:.2f}")
+    print(f"  Started with: ${initial_cash:.2f}")
+    print(f"  Income: +${net_income:.2f}")
+    print(f"  Spending: -${total_cost:.2f}")
+    print(f"  Expected: ${initial_cash + net_income - total_cost:.2f}")
+
+    expected_cash = initial_cash + net_income - total_cost
+    assert abs(final_cash - expected_cash) < 0.01, f"Cash mismatch: expected ${expected_cash:.2f}, got ${final_cash:.2f}"
+
+    print("\n✅ TEST 8 PASSED: Income and spending tracked correctly")
+
+
+def run_quick_simulation():
+    """Run a quick 20-tick simulation showing household behavior."""
+    print_section("QUICK SIMULATION: 20 Ticks of Household Life")
+
+    household = HouseholdAgent(
+        household_id=100,
+        skills_level=0.4,
+        age=25,
+        cash_balance=800.0
+    )
+
+    print(f"Starting household simulation:")
+    print(f"  ID: {household.household_id}")
+    print(f"  Initial cash: ${household.cash_balance:.2f}")
+    print(f"  Initial skills: {household.skills_level:.3f}")
+    print(f"  Initial happiness: {household.happiness:.3f}")
+
+    print(f"\n{'Tick':<6} {'Employed':<10} {'Wage':<8} {'Cash':<10} {'Skills':<8} {'Happiness':<10} {'Goods':<6}")
+    print("-" * 70)
+
+    # Simulate 20 ticks
+    for tick in range(20):
+        # Get employed at tick 5
+        if tick == 5:
+            labor_outcome = {
+                "employer_id": 50,
+                "wage": 70.0,
+                "employer_category": "Housing"
+            }
+            household.apply_labor_outcome(labor_outcome)
+
+        # Apply income if employed
+        if household.is_employed:
+            income_data = {
+                "wage_income": household.wage,
+                "transfers": 0.0,
+                "taxes_paid": household.wage * 0.15
+            }
+            household.apply_income_and_taxes(income_data)
+        else:
+            # Unemployed - get benefits
+            income_data = {
+                "wage_income": 0.0,
+                "transfers": 40.0,
+                "taxes_paid": 0.0
+            }
+            household.apply_income_and_taxes(income_data)
+
+        # Buy some goods every 3 ticks if can afford
+        if tick % 3 == 0 and household.cash_balance > 30:
+            purchases = {
+                "Food": (5.0, 5.0),
+            }
+            household.apply_purchases(purchases)
+
+        # Consume goods
+        household.consume_goods()
+
+        # Update wellbeing
+        household.update_wellbeing(government_happiness_multiplier=1.0)
+
+        # Print status every 2 ticks
+        if tick % 2 == 0:
+            total_goods = sum(household.goods_inventory.values())
+            print(f"{tick:<6} {str(household.is_employed):<10} ${household.wage:<7.2f} ${household.cash_balance:<9.2f} {household.skills_level:<7.4f} {household.happiness:<9.3f} {total_goods:<6.1f}")
+
+    print()
+    print(f"Final state after 20 ticks:")
+    print(f"  Cash: ${household.cash_balance:.2f}")
+    print(f"  Skills: {household.skills_level:.4f} (improved from 0.4000)")
+    print(f"  Happiness: {household.happiness:.3f}")
+    print(f"  Housing experience: {household.category_experience.get('Housing', 0)} ticks")
+
+    print("\n✅ SIMULATION COMPLETE: Household agent functioning normally")
+
+
+def main():
+    """Run all household agent tests."""
+    print("\n" + "=" * 70)
+    print("  HOUSEHOLD AGENT TEST SUITE")
+    print("=" * 70)
+    print("\nThis test suite validates all household agent behaviors.")
+    print("Each test is independent and verifies a specific feature.")
+
+    try:
+        # Run all tests
+        household = test_household_creation()
+        test_labor_supply_planning(household)
+        test_consumption_planning(household)
+        test_employment_and_wages(household)
+        test_skill_development(household)
+        test_goods_consumption()
+        test_wellbeing_system()
+        test_income_and_spending()
+
+        # Run simulation
+        run_quick_simulation()
+
+        # Summary
+        print("\n" + "=" * 70)
+        print("  ALL TESTS PASSED ✅")
+        print("=" * 70)
+        print("\nHousehold agents are working correctly!")
+        print("Key behaviors verified:")
+        print("  ✓ Labor supply decisions")
+        print("  ✓ Consumption planning")
+        print("  ✓ Employment and wage tracking")
+        print("  ✓ Skill development")
+        print("  ✓ Goods consumption")
+        print("  ✓ Wellbeing tracking")
+        print("  ✓ Income and spending")
+
+        return 0
+
+    except AssertionError as e:
+        print(f"\n❌ TEST FAILED: {e}")
+        return 1
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

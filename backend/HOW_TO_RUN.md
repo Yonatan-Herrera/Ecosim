@@ -30,6 +30,7 @@ After completion, you'll find in `sample_data/`:
 NUM_HOUSEHOLDS = 10000          # Number of household agents
 NUM_FIRMS_PER_CATEGORY = 10     # Private firms per category (Food, Housing, Services)
 NUM_TICKS = 500                 # Simulation length
+
 EXPORT_EVERY_N_TICKS = 10       # Database export frequency
 ```
 
