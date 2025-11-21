@@ -5,9 +5,15 @@ This module implements the main simulation coordinator that orchestrates
 households, firms, and government through deterministic tick-based cycles.
 
 All behavior is deterministic - no randomness, I/O, or side effects.
+
+Performance optimizations:
+- Caches household/firm lookups for O(1) access
+- Uses NumPy vectorization for labor and goods market operations
+- Batch operations to minimize Python loop overhead
 """
 
 from typing import Dict, List, Tuple
+import numpy as np
 from agents import HouseholdAgent, FirmAgent, GovernmentAgent
 
 
@@ -40,6 +46,10 @@ class Economy:
         # Track simulation progression and warm-up period state
         self.current_tick = 0
         self.in_warmup = True
+
+        # Performance optimization: Cache lookups for O(1) access
+        self.household_lookup: Dict[int, HouseholdAgent] = {h.household_id: h for h in households}
+        self.firm_lookup: Dict[int, FirmAgent] = {f.firm_id: f for f in firms}
 
         # Initialize tracking dictionaries with defaults
         self.last_tick_sales_units: Dict[int, float] = {}
@@ -276,7 +286,7 @@ class Economy:
         assigned_households = set()
 
         # Track current employers to keep existing matches unless layoffs occur
-        firm_lookup = {firm.firm_id: firm for firm in self.firms}
+        # Use cached firm_lookup instead of rebuilding
         planned_layoffs_set = set()
         for plan in firm_production_plans.values():
             planned_layoffs_set.update(plan.get("planned_layoffs_ids", []))
@@ -285,8 +295,8 @@ class Economy:
             if household.is_employed and household.household_id not in planned_layoffs_set:
                 employer_id = household.employer_id
                 employer_category = None
-                if employer_id is not None and employer_id in firm_lookup:
-                    employer_category = firm_lookup[employer_id].good_category
+                if employer_id is not None and employer_id in self.firm_lookup:
+                    employer_category = self.firm_lookup[employer_id].good_category
                 household_labor_outcomes[household.household_id] = {
                     "employer_id": employer_id,
                     "wage": household.wage,
@@ -331,34 +341,47 @@ class Economy:
             if vacancies <= 0:
                 continue
 
-            # Find eligible candidates
-            eligible_candidates = []
+            # Find eligible candidates (vectorized filtering)
+            # Build arrays for unassigned job seekers
+            unassigned_ids = []
+            unassigned_skills = []
+            unassigned_reservation = []
+
             for household_id, labor_plan in household_labor_plans.items():
-                # Skip if already assigned
-                if household_id in assigned_households:
-                    continue
+                if household_id not in assigned_households and labor_plan["searching_for_job"]:
+                    unassigned_ids.append(household_id)
+                    unassigned_skills.append(labor_plan["skills_level"])
+                    unassigned_reservation.append(labor_plan["reservation_wage"])
 
-                # Check eligibility
-                if (labor_plan["searching_for_job"] and
-                    wage_offer >= labor_plan["reservation_wage"]):
-                    eligible_candidates.append({
-                        "household_id": household_id,
-                        "skills_level": labor_plan["skills_level"]
-                    })
+            if not unassigned_ids:
+                continue
 
-            # Sort candidates by skills (descending), then household_id (ascending)
-            eligible_candidates.sort(
-                key=lambda c: (-c["skills_level"], c["household_id"])
-            )
+            # Vectorized eligibility check
+            unassigned_ids_arr = np.array(unassigned_ids, dtype=np.int32)
+            unassigned_skills_arr = np.array(unassigned_skills, dtype=np.float32)
+            unassigned_reservation_arr = np.array(unassigned_reservation, dtype=np.float32)
+
+            # Filter by wage offer
+            eligible_mask = wage_offer >= unassigned_reservation_arr
+            eligible_ids = unassigned_ids_arr[eligible_mask]
+            eligible_skills = unassigned_skills_arr[eligible_mask]
+
+            if len(eligible_ids) == 0:
+                continue
+
+            # Sort by skills (descending), then by id (ascending)
+            sort_keys = np.lexsort((eligible_ids, -eligible_skills))
+            eligible_ids = eligible_ids[sort_keys]
+            eligible_skills = eligible_skills[sort_keys]
 
             # Assign up to vacancies
-            hired_count = min(vacancies, len(eligible_candidates))
+            hired_count = min(vacancies, len(eligible_ids))
             for i in range(hired_count):
-                household_id = eligible_candidates[i]["household_id"]
-                skills_level = eligible_candidates[i]["skills_level"]
+                household_id = int(eligible_ids[i])
+                skills_level = float(eligible_skills[i])
 
-                # Get household to check experience
-                household = next(h for h in self.households if h.household_id == household_id)
+                # Get household to check experience (O(1) lookup via cache)
+                household = self.household_lookup[household_id]
 
                 # Calculate skill premium (50% max for skill level 1.0)
                 skill_premium = skills_level * 0.5
@@ -411,11 +434,9 @@ class Economy:
                 "revenue": 0.0
             }
 
-        # Group firms by good_name and build lookup by id
+        # Group firms by good_name (use cached firm_lookup instead of rebuilding)
         goods_to_firms: Dict[str, List[FirmAgent]] = {}
-        firm_lookup_by_id: Dict[int, FirmAgent] = {}
         for firm in firms:
-            firm_lookup_by_id[firm.firm_id] = firm
             if firm.good_name not in goods_to_firms:
                 goods_to_firms[firm.good_name] = []
             goods_to_firms[firm.good_name].append(firm)
@@ -447,7 +468,7 @@ class Economy:
                     continue
 
                 if isinstance(purchase_target, int):
-                    firm = firm_lookup_by_id.get(purchase_target)
+                    firm = self.firm_lookup.get(purchase_target)
                     if firm is None:
                         continue
 
@@ -690,8 +711,8 @@ class Economy:
 
                 # Firm is bankrupt - lay off all employees
                 for employee_id in firm.employees:
-                    # Find household and unemploy them
-                    household = next((h for h in self.households if h.household_id == employee_id), None)
+                    # Find household and unemploy them (O(1) lookup via cache)
+                    household = self.household_lookup.get(employee_id)
                     if household is not None:
                         household.employer_id = None
                         household.wage = 0.0
@@ -709,6 +730,10 @@ class Economy:
                 del self.last_tick_revenue[firm.firm_id]
             if firm.firm_id in self.last_tick_sell_through_rate:
                 del self.last_tick_sell_through_rate[firm.firm_id]
+
+            # Clean up firm cache
+            if firm.firm_id in self.firm_lookup:
+                del self.firm_lookup[firm.firm_id]
 
     def _maybe_create_new_firms(self) -> None:
         """
@@ -791,6 +816,9 @@ class Economy:
         self.last_tick_sell_through_rate[new_firm_id] = 0.5
         self.last_tick_prices[new_firm.good_name] = new_firm.price
 
+        # Add to firm cache
+        self.firm_lookup[new_firm_id] = new_firm
+
     def _adjust_government_policy(self) -> None:
         """
         Calculate economic indicators and adjust government policy.
@@ -853,3 +881,118 @@ class Economy:
         # Average price per good (deterministic)
         for good_name, prices in good_prices.items():
             self.last_tick_prices[good_name] = sum(prices) / len(prices)
+
+    def get_economic_metrics(self) -> Dict[str, float]:
+        """
+        Calculate comprehensive economic metrics for monitoring and display.
+
+        Returns:
+            Dictionary with economic indicators including GDP, unemployment,
+            wages, firm metrics, household metrics, and government finances.
+        """
+        metrics = {}
+
+        # Household metrics
+        if self.households:
+            employed_households = [h for h in self.households if h.is_employed]
+            unemployed_households = [h for h in self.households if not h.is_employed]
+
+            metrics["total_households"] = len(self.households)
+            metrics["employed_count"] = len(employed_households)
+            metrics["unemployed_count"] = len(unemployed_households)
+            metrics["unemployment_rate"] = len(unemployed_households) / len(self.households)
+
+            # Wage statistics
+            if employed_households:
+                wages = [h.wage for h in employed_households]
+                metrics["mean_wage"] = sum(wages) / len(wages)
+                metrics["median_wage"] = sorted(wages)[len(wages) // 2]
+                metrics["min_wage"] = min(wages)
+                metrics["max_wage"] = max(wages)
+            else:
+                metrics["mean_wage"] = 0.0
+                metrics["median_wage"] = 0.0
+                metrics["min_wage"] = 0.0
+                metrics["max_wage"] = 0.0
+
+            # Household cash/wealth
+            household_cash = [h.cash_balance for h in self.households]
+            metrics["total_household_cash"] = sum(household_cash)
+            metrics["mean_household_cash"] = sum(household_cash) / len(household_cash)
+            metrics["median_household_cash"] = sorted(household_cash)[len(household_cash) // 2]
+
+            # Wellbeing metrics
+            metrics["mean_happiness"] = sum(h.happiness for h in self.households) / len(self.households)
+            metrics["mean_morale"] = sum(h.morale for h in self.households) / len(self.households)
+            metrics["mean_health"] = sum(h.health for h in self.households) / len(self.households)
+
+            # Skills
+            metrics["mean_skills"] = sum(h.skills_level for h in self.households) / len(self.households)
+        else:
+            metrics.update({
+                "total_households": 0, "employed_count": 0, "unemployed_count": 0,
+                "unemployment_rate": 0.0, "mean_wage": 0.0, "median_wage": 0.0,
+                "min_wage": 0.0, "max_wage": 0.0, "total_household_cash": 0.0,
+                "mean_household_cash": 0.0, "median_household_cash": 0.0,
+                "mean_happiness": 0.0, "mean_morale": 0.0, "mean_health": 0.0,
+                "mean_skills": 0.0
+            })
+
+        # Firm metrics
+        if self.firms:
+            firm_cash = [f.cash_balance for f in self.firms]
+            metrics["total_firms"] = len(self.firms)
+            metrics["total_firm_cash"] = sum(firm_cash)
+            metrics["mean_firm_cash"] = sum(firm_cash) / len(firm_cash)
+            metrics["median_firm_cash"] = sorted(firm_cash)[len(firm_cash) // 2]
+
+            # Inventory
+            total_inventory = sum(f.inventory_units for f in self.firms)
+            metrics["total_firm_inventory"] = total_inventory
+
+            # Employees
+            total_employees = sum(len(f.employees) for f in self.firms)
+            metrics["total_employees"] = total_employees
+
+            # Prices
+            prices = [f.price for f in self.firms]
+            metrics["mean_price"] = sum(prices) / len(prices)
+            metrics["median_price"] = sorted(prices)[len(prices) // 2]
+
+            # Quality
+            qualities = [f.quality_level for f in self.firms]
+            metrics["mean_quality"] = sum(qualities) / len(qualities)
+        else:
+            metrics.update({
+                "total_firms": 0, "total_firm_cash": 0.0, "mean_firm_cash": 0.0,
+                "median_firm_cash": 0.0, "total_firm_inventory": 0.0,
+                "total_employees": 0, "mean_price": 0.0, "median_price": 0.0,
+                "mean_quality": 0.0
+            })
+
+        # GDP calculation (sum of all firm revenues this tick)
+        metrics["gdp_this_tick"] = sum(self.last_tick_revenue.values())
+
+        # Government metrics
+        metrics["government_cash"] = self.government.cash_balance
+        metrics["wage_tax_rate"] = self.government.wage_tax_rate
+        metrics["profit_tax_rate"] = self.government.profit_tax_rate
+        metrics["unemployment_benefit"] = self.government.unemployment_benefit_level
+        metrics["transfer_budget"] = self.government.transfer_budget
+
+        # Infrastructure multipliers
+        metrics["infrastructure_productivity"] = self.government.infrastructure_productivity_multiplier
+        metrics["technology_quality"] = self.government.technology_quality_multiplier
+        metrics["social_happiness"] = self.government.social_happiness_multiplier
+
+        # Total wealth in economy
+        metrics["total_economy_cash"] = (
+            metrics["total_household_cash"] +
+            metrics["total_firm_cash"] +
+            metrics["government_cash"]
+        )
+
+        # Current tick
+        metrics["current_tick"] = self.current_tick
+
+        return metrics

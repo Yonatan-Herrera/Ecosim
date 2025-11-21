@@ -425,8 +425,9 @@ def main():
     print(f"Running simulation for {NUM_TICKS} ticks...")
     print(f"(Exporting to database every {EXPORT_EVERY_N_TICKS} ticks)")
     print()
-    print("Tick | Time(s) | Firms | Unemploy |   Happiness | Avg Wage | Gov Cash")
-    print("-" * 80)
+    print("=" * 120)
+    print(" TICK | Time(s) |  GDP/Tick | Firms | Unemp% | Avg Wage |   Happiness | Firm Wealth | HH Wealth | Gov Cash")
+    print("=" * 120)
 
     tick_time_history: deque[float] = deque(maxlen=10)
     tick_time_sum = 0.0
@@ -449,10 +450,13 @@ def main():
         # Print progress every 10 ticks
         if tick % 10 == 0 or tick == NUM_TICKS - 1:
             avg_tick_time = sum(tick_time_history) / len(tick_time_history)
+            metrics = economy.get_economic_metrics()
 
-            print(f"{tick:4d} | {avg_tick_time:7.3f} | {len(economy.firms):5d} | "
-                  f"{household_stats['unemployment_rate']:7.1%} | {household_stats['mean_happiness']:11.3f} | "
-                  f"${household_stats['mean_wage']:7.2f} | ${economy.government.cash_balance:9.0f}")
+            print(f" {tick:4d} | {avg_tick_time:7.3f} | ${metrics['gdp_this_tick']:9,.0f} | "
+                  f"{metrics['total_firms']:5d} | {metrics['unemployment_rate']:5.1%} | "
+                  f"${metrics['mean_wage']:8.2f} | {metrics['mean_happiness']:11.3f} | "
+                  f"${metrics['total_firm_cash']:11,.0f} | ${metrics['total_household_cash']:9,.0f} | "
+                  f"${metrics['government_cash']:9,.0f}")
 
     print()
     total_time = time.time() - start_time
@@ -529,20 +533,97 @@ def main():
 
     print(f"✓ Summary saved to: {summary_path}")
     print()
-    print("=" * 80)
-    print("SIMULATION SUMMARY")
-    print("=" * 80)
-    print(f"Total agents: {NUM_HOUSEHOLDS + len(economy.firms) + 1:,}")
-    print(f"Total ticks: {NUM_TICKS}")
-    print(f"Final unemployment rate: {summary['final_state']['unemployment_rate']:.1%}")
-    print(f"Final mean wage: ${summary['final_state']['mean_wage']:.2f}")
-    print(f"Final mean happiness: {summary['final_state']['mean_happiness']:.3f}")
-    print(f"Performance: {avg_tick_time*1000:.1f}ms per tick")
+
+    # Get final comprehensive metrics
+    final_metrics = economy.get_economic_metrics()
+
+    print("=" * 120)
+    print("COMPREHENSIVE ECONOMIC DASHBOARD - FINAL STATE")
+    print("=" * 120)
     print()
-    print("Files generated:")
-    print(f"  - {db_path}")
-    print(f"  - {summary_path}")
+
+    # GDP & Economic Output
+    print("📊 ECONOMIC OUTPUT")
+    print("-" * 120)
+    total_gdp = sum([row[1] for row in metrics_over_time])
+    avg_gdp = total_gdp / len(metrics_over_time) if metrics_over_time else 0
+    print(f"  Total GDP (all ticks):        ${total_gdp:15,.0f}")
+    print(f"  Average GDP per tick:         ${avg_gdp:15,.0f}")
+    print(f"  Final tick GDP:               ${final_metrics['gdp_this_tick']:15,.0f}")
+    print(f"  Total economy wealth:         ${final_metrics['total_economy_cash']:15,.0f}")
     print()
+
+    # Labor Market
+    print("👥 LABOR MARKET")
+    print("-" * 120)
+    print(f"  Total households:             {final_metrics['total_households']:15,}")
+    print(f"  Employed:                     {final_metrics['employed_count']:15,} ({100 - final_metrics['unemployment_rate']*100:.1f}%)")
+    print(f"  Unemployed:                   {final_metrics['unemployed_count']:15,} ({final_metrics['unemployment_rate']*100:.1f}%)")
+    print(f"  Mean wage:                    ${final_metrics['mean_wage']:15,.2f}")
+    print(f"  Median wage:                  ${final_metrics['median_wage']:15,.2f}")
+    print(f"  Wage range:                   ${final_metrics['min_wage']:,.2f} - ${final_metrics['max_wage']:,.2f}")
+    print()
+
+    # Household Wellbeing
+    print("😊 HOUSEHOLD WELLBEING")
+    print("-" * 120)
+    print(f"  Mean happiness:               {final_metrics['mean_happiness']:15.3f} (0-1 scale)")
+    print(f"  Mean morale:                  {final_metrics['mean_morale']:15.3f} (0-1 scale)")
+    print(f"  Mean health:                  {final_metrics['mean_health']:15.3f} (0-1 scale)")
+    print(f"  Mean skills:                  {final_metrics['mean_skills']:15.3f} (0-1 scale)")
+    print()
+
+    # Household Finances
+    print("💰 HOUSEHOLD FINANCES")
+    print("-" * 120)
+    print(f"  Total household wealth:       ${final_metrics['total_household_cash']:15,.0f}")
+    print(f"  Mean household cash:          ${final_metrics['mean_household_cash']:15,.2f}")
+    print(f"  Median household cash:        ${final_metrics['median_household_cash']:15,.2f}")
+    print()
+
+    # Firm Sector
+    print("🏢 FIRM SECTOR")
+    print("-" * 120)
+    print(f"  Total firms operating:        {final_metrics['total_firms']:15,}")
+    print(f"  Total firm wealth:            ${final_metrics['total_firm_cash']:15,.0f}")
+    print(f"  Mean firm cash:               ${final_metrics['mean_firm_cash']:15,.2f}")
+    print(f"  Median firm cash:             ${final_metrics['median_firm_cash']:15,.2f}")
+    print(f"  Total inventory:              {final_metrics['total_firm_inventory']:15,.0f} units")
+    print(f"  Total employees:              {final_metrics['total_employees']:15,}")
+    print(f"  Mean price:                   ${final_metrics['mean_price']:15,.2f}")
+    print(f"  Mean quality:                 {final_metrics['mean_quality']:15.2f} (0-10 scale)")
+    print()
+
+    # Government
+    print("🏛️  GOVERNMENT FINANCES & POLICY")
+    print("-" * 120)
+    print(f"  Government cash balance:      ${final_metrics['government_cash']:15,.0f}")
+    print(f"  Wage tax rate:                {final_metrics['wage_tax_rate']*100:15.1f}%")
+    print(f"  Profit tax rate:              {final_metrics['profit_tax_rate']*100:15.1f}%")
+    print(f"  Unemployment benefit:         ${final_metrics['unemployment_benefit']:15,.2f}")
+    print(f"  Transfer budget:              ${final_metrics['transfer_budget']:15,.0f}")
+    print()
+    print(f"  Infrastructure multiplier:    {final_metrics['infrastructure_productivity']:15.3f}x")
+    print(f"  Technology multiplier:        {final_metrics['technology_quality']:15.3f}x")
+    print(f"  Social happiness multiplier:  {final_metrics['social_happiness']:15.3f}x")
+    print()
+
+    # Performance
+    print("⚡ SIMULATION PERFORMANCE")
+    print("-" * 120)
+    print(f"  Total agents:                 {NUM_HOUSEHOLDS + len(economy.firms) + 1:15,}")
+    print(f"  Total ticks:                  {NUM_TICKS:15,}")
+    print(f"  Total time:                   {total_time:15.2f} seconds ({total_time/60:.2f} minutes)")
+    print(f"  Average tick time:            {avg_tick_time*1000:15.1f} ms")
+    print(f"  Ticks per second:             {1/avg_tick_time:15.2f}")
+    print()
+
+    print("📁 FILES GENERATED")
+    print("-" * 120)
+    print(f"  Database:  {db_path}")
+    print(f"  Summary:   {summary_path}")
+    print()
+    print("=" * 120)
 
 
 if __name__ == "__main__":
