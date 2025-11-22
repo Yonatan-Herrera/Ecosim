@@ -27,14 +27,14 @@ class HouseholdAgent:
     # Economic state
     cash_balance: float
     goods_inventory: Dict[str, float] = field(default_factory=dict)
-    employer_id: int | None = None
+    employer_id: Optional[int] = None
     wage: float = 0.0
     ticks: int=1
     # Preferences and heuristics
     consumption_budget_share: float = 0.7  # Legacy field (overridden by savings_rate_target if set)
     good_weights: Dict[str, float] = field(default_factory=dict)  # DEPRECATED: use category_weights
     category_weights: Dict[str, float] = field(default_factory=dict)  # category -> share of budget
-    savings_rate_target: float | None = None  # long-run desired savings share [0,1]
+    savings_rate_target: Optional[float] = None  # long-run desired savings share [0,1]
     default_purchase_style: str = "value"
     purchase_styles: Dict[str, str] = field(default_factory=dict)  # category -> cheap/value/quality
 
@@ -66,6 +66,7 @@ class HouseholdAgent:
     happiness: float = 0.7  # 0-1 scale, affects productivity and consumption
     morale: float = 0.7  # 0-1 scale, affects work performance
     health: float = 1.0  # 0-1 scale, affects productivity and skill development
+    unemployment_duration: int = 0  # consecutive ticks without employment
 
     # Wellbeing dynamics
     happiness_decay_rate: float = 0.01  # Happiness naturally decays without maintenance
@@ -139,6 +140,54 @@ class HouseholdAgent:
 
         return {category: weight / total for category, weight in normalized.items()}
 
+    def _get_affordability_score(self) -> float:
+        """
+        Calculate a normalized affordability score based on skills, cash, and wages.
+
+        Returns:
+            Float in [0.1, 4.0] representing how flexible the household can be on prices.
+        """
+        wage_basis = self.wage if self.wage > 0 else self.expected_wage
+        skill_component = self.skills_level * 1.5
+        cash_component = min(3.0, self.cash_balance / 400.0)
+        wage_component = min(3.0, wage_basis / 40.0)
+
+        score = 0.3 * skill_component + 0.35 * cash_component + 0.35 * wage_component
+        return max(0.1, min(4.0, score))
+
+    def _get_category_price_cap(
+        self,
+        category: str,
+        options: List[Dict[str, float]]
+    ) -> float:
+        """
+        Determine the maximum acceptable price for a category this tick.
+        """
+        prices = [opt.get("price", 0.0) for opt in options if opt.get("price", 0.0) > 0]
+        if not prices:
+            return 0.0
+
+        prices.sort()
+        min_price = prices[0]
+        max_price = prices[-1]
+        median_price = prices[len(prices) // 2]
+
+        affordability = self._get_affordability_score()
+        wage_basis = self.wage if self.wage > 0 else self.expected_wage
+        liquid_cash = max(25.0, self.cash_balance * 0.2 + wage_basis)
+
+        base_cap = min_price * (1.2 + 2.5 * affordability)
+        median_cap = median_price * (0.8 + affordability)
+        premium_cap = max_price * min(affordability, 2.5)
+
+        price_cap = max(base_cap, median_cap, premium_cap)
+        price_cap = min(price_cap, liquid_cash)
+
+        if affordability > 2.0:
+            price_cap = max(price_cap, min(liquid_cash * 1.2, max_price))
+
+        return max(min_price * 1.1, price_cap)
+
     def _plan_category_purchases(
         self,
         budget: float,
@@ -157,14 +206,31 @@ class HouseholdAgent:
             if not options:
                 continue
 
+            price_cap = self._get_category_price_cap(category, options)
+            if price_cap <= 0:
+                continue
+
+            affordable_options = [
+                option for option in options
+                if 0 < option.get("price", 0.0) <= price_cap
+            ]
+            if not affordable_options:
+                continue
+
             style = self.purchase_styles.get(category, self.default_purchase_style)
-            chosen = self._choose_firm_based_on_style(options, style)
+            chosen = self._choose_firm_based_on_style(affordable_options, style)
             if chosen is None or chosen.get("price", 0.0) <= 0:
                 continue
 
             quantity = category_budget / chosen["price"]
             if quantity <= 0:
                 continue
+
+            cap_ratio = chosen["price"] / price_cap
+            if cap_ratio > 0.85:
+                sensitivity = max(0.2, min(1.5, self.price_sensitivity))
+                scale = 1.0 - sensitivity * (cap_ratio - 0.85) * 3.0
+                quantity *= max(0.15, scale)
 
             firm_id = chosen["firm_id"]
             planned[firm_id] = planned.get(firm_id, 0.0) + quantity
@@ -419,10 +485,12 @@ class HouseholdAgent:
         employer_category = outcome.get("employer_category", None)
 
         # Track experience in category (increment by 1 tick if employed)
-        if self.is_employed and employer_category is not None:
-            if employer_category not in self.category_experience:
-                self.category_experience[employer_category] = 0
-            self.category_experience[employer_category] += 1
+        if self.is_employed:
+            self.unemployment_duration = 0
+            if employer_category is not None:
+                if employer_category not in self.category_experience:
+                    self.category_experience[employer_category] = 0
+                self.category_experience[employer_category] += 1
 
             # Passive skill growth through work experience (diminishing returns)
             skill_improvement = self.skill_growth_rate * (1.0 - self.skills_level)
@@ -436,8 +504,16 @@ class HouseholdAgent:
                 (1.0 - self.wage_expectation_alpha) * self.expected_wage
             )
         else:
+            self.unemployment_duration += 1
             # Unemployed: gently nudge expected wage downward
-            decay_factor = 0.98  # deterministic slow decay
+            duration_pressure = min(0.35, self.unemployment_duration * 0.01)
+            happiness_gap = max(0.0, 0.7 - self.happiness)
+            happiness_pressure = min(0.3, happiness_gap * 0.5)
+            base_decay = 0.97  # slightly faster baseline decay
+            decay_factor = max(
+                0.5,
+                base_decay - duration_pressure - happiness_pressure
+            )
             self.expected_wage = max(self.expected_wage * decay_factor, 10.0)
 
         # Update reservation wage toward expected wage (slow adjustment)
@@ -890,9 +966,9 @@ class FirmAgent:
         )
 
         import math
-        
 
-        current_workers = len(self.employees) #+len(self.employers_id)
+
+        current_workers = len(self.employees)
         planned_hires = 0
         planned_layoffs: List[int] = []
 
