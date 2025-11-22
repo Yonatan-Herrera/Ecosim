@@ -42,10 +42,12 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
         cash_balance=num_households * 3000.0     # Scale with population
     )
 
+    # Baseline firm prices set to be competitive but not artificially low
+    # This prevents them from dominating the market early on
     baseline_prices = {
-        "Food": 5.0,
-        "Housing": 15.0,
-        "Services": 7.0,
+        "Food": 8.0,      # Increased from 5.0 - competitive with private firms
+        "Housing": 20.0,  # Increased from 15.0 - competitive with private firms
+        "Services": 10.0, # Increased from 7.0 - competitive with private firms
     }
 
     # Create firms
@@ -53,7 +55,8 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
     next_firm_id = 1
 
     # Create baseline firms (government-controlled "safety net")
-    # These should be LOWER quality than private firms, and eventually die out
+    # These provide basic goods at competitive prices, not artificially low prices
+    # They should serve as a fallback option, not dominate the market
     print(f"Creating {len(essential_categories)} baseline firms...")
     for category in essential_categories:
         baseline_firm = FirmAgent(
@@ -64,7 +67,7 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
             good_category=category,
             quality_level=3.0,          # LOW quality (on 0-10 scale) - government basic goods
             wage_offer=25.0,
-            price=baseline_prices.get(category, 5.0),
+            price=baseline_prices.get(category, 8.0),
             expected_sales_units=num_households * 0.1,
             production_capacity_units=100_000.0,  # Reduced from 200k
             units_per_worker=40.0,

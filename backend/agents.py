@@ -1090,9 +1090,9 @@ class FirmAgent:
         )
 
         import math
-        
 
-        current_workers = len(self.employees) #+len(self.employers_id)
+
+        current_workers = len(self.employees)
         planned_hires = 0
         planned_layoffs: List[int] = []
 
