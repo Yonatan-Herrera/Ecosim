@@ -10,7 +10,7 @@ import sqlite3
 import time
 from collections import deque
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -284,7 +284,7 @@ def export_tick_data(
     economy: Economy,
     tick: int,
     conn: sqlite3.Connection,
-    household_stats: Dict[str, float] | None = None
+    household_stats: Optional[Dict[str, float]] = None
 ):
     """Export current tick data using an open database connection."""
     cursor = conn.cursor()
