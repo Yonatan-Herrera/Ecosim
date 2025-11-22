@@ -30,6 +30,7 @@ class HouseholdAgent:
     employer_id: Optional[int] = None
     wage: float = 0.0
     ticks: int=1
+    owns_housing: bool = False  # Track if household already owns housing
     # Preferences and heuristics
     consumption_budget_share: float = 0.7  # Legacy field (overridden by savings_rate_target if set)
     good_weights: Dict[str, float] = field(default_factory=dict)  # DEPRECATED: use category_weights
@@ -72,6 +73,10 @@ class HouseholdAgent:
     happiness_decay_rate: float = 0.01  # Happiness naturally decays without maintenance
     morale_decay_rate: float = 0.02  # Morale decays faster than happiness
     health_decay_rate: float = 0.005  # Health decays slowly over time
+
+    # Minimum consumption requirements per tick
+    min_food_per_tick: float = 2.0  # Minimum food units needed per tick
+    min_services_per_tick: float = 1.0  # Minimum services units needed per tick
 
     def __post_init__(self):
         """Validate invariants after initialization."""
@@ -193,47 +198,155 @@ class HouseholdAgent:
         budget: float,
         firm_market_info: Dict[str, List[Dict[str, float]]]
     ) -> Dict[int, float]:
+        """
+        Plan purchases with requirements:
+        - Food: must buy at least min_food_per_tick units
+        - Housing: buy exactly 1 unit if not already owned, 0 otherwise
+        - Services: must buy at least min_services_per_tick units
+        """
         planned: Dict[int, float] = {}
-        for category, weight in self.category_weights.items():
-            if weight <= 0:
-                continue
+        remaining_budget = budget
 
-            category_budget = budget * weight
-            if category_budget <= 0:
-                continue
+        # Priority 1: Handle housing (only one unit, ever)
+        if "housing" in self.category_weights:
+            housing_options = firm_market_info.get("housing", [])
 
-            options = firm_market_info.get(category, [])
-            if not options:
-                continue
+            if housing_options and not self.owns_housing:
+                # Only buy housing if we don't already own one
+                price_cap = self._get_category_price_cap("housing", housing_options)
+                if price_cap > 0:
+                    affordable_options = [
+                        option for option in housing_options
+                        if 0 < option.get("price", 0.0) <= price_cap
+                    ]
 
-            price_cap = self._get_category_price_cap(category, options)
-            if price_cap <= 0:
-                continue
+                    if affordable_options:
+                        style = self.purchase_styles.get("housing", self.default_purchase_style)
+                        chosen = self._choose_firm_based_on_style(affordable_options, style)
 
-            affordable_options = [
-                option for option in options
-                if 0 < option.get("price", 0.0) <= price_cap
-            ]
-            if not affordable_options:
-                continue
+                        if chosen is not None and chosen.get("price", 0.0) > 0:
+                            housing_price = chosen["price"]
 
-            style = self.purchase_styles.get(category, self.default_purchase_style)
-            chosen = self._choose_firm_based_on_style(affordable_options, style)
-            if chosen is None or chosen.get("price", 0.0) <= 0:
-                continue
+                            # Only buy if we can afford it
+                            if housing_price <= remaining_budget:
+                                firm_id = chosen["firm_id"]
+                                planned[firm_id] = planned.get(firm_id, 0.0) + 1.0  # Exactly 1 unit
+                                remaining_budget -= housing_price
 
-            quantity = category_budget / chosen["price"]
-            if quantity <= 0:
-                continue
+        # Priority 2: Ensure minimum food consumption
+        if "food" in self.category_weights:
+            food_options = firm_market_info.get("food", [])
 
-            cap_ratio = chosen["price"] / price_cap
-            if cap_ratio > 0.85:
-                sensitivity = max(0.2, min(1.5, self.price_sensitivity))
-                scale = 1.0 - sensitivity * (cap_ratio - 0.85) * 3.0
-                quantity *= max(0.15, scale)
+            if food_options:
+                price_cap = self._get_category_price_cap("food", food_options)
+                if price_cap > 0:
+                    affordable_options = [
+                        option for option in food_options
+                        if 0 < option.get("price", 0.0) <= price_cap
+                    ]
 
-            firm_id = chosen["firm_id"]
-            planned[firm_id] = planned.get(firm_id, 0.0) + quantity
+                    if affordable_options:
+                        style = self.purchase_styles.get("food", self.default_purchase_style)
+                        chosen = self._choose_firm_based_on_style(affordable_options, style)
+
+                        if chosen is not None and chosen.get("price", 0.0) > 0:
+                            food_price = chosen["price"]
+                            min_food_cost = self.min_food_per_tick * food_price
+
+                            # Allocate budget for minimum food, or as much as we can afford
+                            if min_food_cost <= remaining_budget:
+                                food_quantity = self.min_food_per_tick
+                                actual_cost = min_food_cost
+                            else:
+                                # Can't afford minimum - buy what we can
+                                food_quantity = remaining_budget / food_price
+                                actual_cost = remaining_budget
+
+                            if food_quantity > 0:
+                                firm_id = chosen["firm_id"]
+                                planned[firm_id] = planned.get(firm_id, 0.0) + food_quantity
+                                remaining_budget -= actual_cost
+
+        # Priority 3: Ensure minimum services consumption
+        if "services" in self.category_weights:
+            services_options = firm_market_info.get("services", [])
+
+            if services_options:
+                price_cap = self._get_category_price_cap("services", services_options)
+                if price_cap > 0:
+                    affordable_options = [
+                        option for option in services_options
+                        if 0 < option.get("price", 0.0) <= price_cap
+                    ]
+
+                    if affordable_options:
+                        style = self.purchase_styles.get("services", self.default_purchase_style)
+                        chosen = self._choose_firm_based_on_style(affordable_options, style)
+
+                        if chosen is not None and chosen.get("price", 0.0) > 0:
+                            services_price = chosen["price"]
+                            min_services_cost = self.min_services_per_tick * services_price
+
+                            # Allocate budget for minimum services, or as much as we can afford
+                            if min_services_cost <= remaining_budget:
+                                services_quantity = self.min_services_per_tick
+                                actual_cost = min_services_cost
+                            else:
+                                # Can't afford minimum - buy what we can
+                                services_quantity = remaining_budget / services_price
+                                actual_cost = remaining_budget
+
+                            if services_quantity > 0:
+                                firm_id = chosen["firm_id"]
+                                planned[firm_id] = planned.get(firm_id, 0.0) + services_quantity
+                                remaining_budget -= actual_cost
+
+        # Priority 4: Allocate remaining budget proportionally across all categories
+        if remaining_budget > 0:
+            for category, weight in self.category_weights.items():
+                if weight <= 0:
+                    continue
+
+                # Skip housing - already handled (max 1 unit)
+                if category == "housing":
+                    continue
+
+                category_budget = remaining_budget * weight
+                if category_budget <= 0:
+                    continue
+
+                options = firm_market_info.get(category, [])
+                if not options:
+                    continue
+
+                price_cap = self._get_category_price_cap(category, options)
+                if price_cap <= 0:
+                    continue
+
+                affordable_options = [
+                    option for option in options
+                    if 0 < option.get("price", 0.0) <= price_cap
+                ]
+                if not affordable_options:
+                    continue
+
+                style = self.purchase_styles.get(category, self.default_purchase_style)
+                chosen = self._choose_firm_based_on_style(affordable_options, style)
+                if chosen is None or chosen.get("price", 0.0) <= 0:
+                    continue
+
+                quantity = category_budget / chosen["price"]
+                if quantity <= 0:
+                    continue
+
+                cap_ratio = chosen["price"] / price_cap
+                if cap_ratio > 0.85:
+                    sensitivity = max(0.2, min(1.5, self.price_sensitivity))
+                    scale = 1.0 - sensitivity * (cap_ratio - 0.85) * 3.0
+                    quantity *= max(0.15, scale)
+
+                firm_id = chosen["firm_id"]
+                planned[firm_id] = planned.get(firm_id, 0.0) + quantity
 
         return planned
 
@@ -301,6 +414,7 @@ class HouseholdAgent:
             "goods_inventory": dict(self.goods_inventory),
             "employer_id": self.employer_id,
             "wage": self.wage,
+            "owns_housing": self.owns_housing,
             "consumption_budget_share": self.consumption_budget_share,
             "good_weights": dict(self.good_weights),
             "category_weights": dict(self.category_weights),
@@ -317,6 +431,8 @@ class HouseholdAgent:
             "reservation_markup_over_benefit": self.reservation_markup_over_benefit,
             "default_price_level": self.default_price_level,
             "min_cash_for_aggressive_job_search": self.min_cash_for_aggressive_job_search,
+            "min_food_per_tick": self.min_food_per_tick,
+            "min_services_per_tick": self.min_services_per_tick,
         }
 
     def apply_overrides(self, overrides: Dict[str, object]) -> None:
@@ -538,7 +654,8 @@ class HouseholdAgent:
 
         self.cash_balance += wage_income + transfers - taxes_paid
 
-    def apply_purchases(self, purchases: Dict[str, tuple[float, float]]) -> None:
+    def apply_purchases(self, purchases: Dict[str, tuple[float, float]],
+                        firm_categories: Optional[Dict[str, str]] = None) -> None:
         """
         Update inventory, cash, and price beliefs based on executed purchases.
 
@@ -546,11 +663,18 @@ class HouseholdAgent:
 
         Args:
             purchases: Dict mapping good_name -> (quantity, price_paid)
+            firm_categories: Optional dict mapping good_name -> category (to detect housing purchases)
         """
         for good, (quantity, price_paid) in purchases.items():
             # Update cash
             total_cost = quantity * price_paid
             self.cash_balance -= total_cost
+
+            # Check if this is a housing purchase
+            if firm_categories is not None:
+                category = firm_categories.get(good, "").lower()
+                if category == "housing" and quantity > 0:
+                    self.owns_housing = True
 
             # Update inventory
             if good not in self.goods_inventory:
