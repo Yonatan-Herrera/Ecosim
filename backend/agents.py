@@ -587,7 +587,11 @@ class HouseholdAgent:
                 "planned_purchases": planned_purchases,
             }
 
-    def apply_labor_outcome(self, outcome: Dict[str, object]) -> None:
+    def apply_labor_outcome(
+        self,
+        outcome: Dict[str, object],
+        market_wage_anchor: Optional[float] = None
+    ) -> None:
         """
         Update employment status and wage beliefs based on labor market outcome.
 
@@ -595,6 +599,7 @@ class HouseholdAgent:
 
         Args:
             outcome: Dict with employer_id (int | None), wage (float), and employer_category (str | None)
+            market_wage_anchor: Optional market-paid wage to nudge expectations toward
         """
         self.employer_id = outcome["employer_id"]
         self.wage = outcome["wage"]
@@ -630,7 +635,16 @@ class HouseholdAgent:
                 0.5,
                 base_decay - duration_pressure - happiness_pressure
             )
-            self.expected_wage = max(self.expected_wage * decay_factor, 10.0)
+            decayed_expectation = max(self.expected_wage * decay_factor, 10.0)
+
+            if market_wage_anchor is not None:
+                anchor_weight = 0.4  # stronger pull toward market when unemployed
+                self.expected_wage = (
+                    (1.0 - anchor_weight) * decayed_expectation
+                    + anchor_weight * market_wage_anchor
+                )
+            else:
+                self.expected_wage = decayed_expectation
 
         # Update reservation wage toward expected wage (slow adjustment)
         reservation_adjustment_rate = 0.1

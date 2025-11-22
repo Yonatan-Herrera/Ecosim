@@ -136,11 +136,39 @@ class Economy:
         )
 
         # Phase 4: Apply labor outcomes
+        market_paid_wages = []
+        for outcome in firm_labor_outcomes.values():
+            market_paid_wages.extend(outcome.get("actual_wages", {}).values())
+
+        def _percentile(values: List[float], pct: float) -> Optional[float]:
+            if not values:
+                return None
+            sorted_vals = sorted(values)
+            if len(sorted_vals) == 1:
+                return sorted_vals[0]
+            idx = min(len(sorted_vals) - 1, int(pct * (len(sorted_vals) - 1)))
+            return sorted_vals[idx]
+
+        wage_anchor_low = _percentile(market_paid_wages, 0.25)
+        wage_anchor_mid = _percentile(market_paid_wages, 0.50)
+        wage_anchor_high = _percentile(market_paid_wages, 0.75)
+
         for firm in self.firms:
             firm.apply_labor_outcome(firm_labor_outcomes[firm.firm_id])
 
         for household in self.households:
-            household.apply_labor_outcome(household_labor_outcomes[household.household_id])
+            anchor = None
+            if household.skills_level < 0.4:
+                anchor = wage_anchor_low
+            elif household.skills_level > 0.7:
+                anchor = wage_anchor_high
+            else:
+                anchor = wage_anchor_mid
+
+            household.apply_labor_outcome(
+                household_labor_outcomes[household.household_id],
+                market_wage_anchor=anchor
+            )
 
         # Phase 5: Firms apply production and costs
         for firm in self.firms:
