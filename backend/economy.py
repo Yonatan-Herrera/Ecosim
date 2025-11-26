@@ -104,11 +104,21 @@ class Economy:
         household_labor_plans = {}
         household_consumption_plans = {}
 
+        employed_count = sum(1 for h in self.households if h.is_employed)
+        total_households = len(self.households)
+        global_unemployment_rate = (
+            1.0 - (employed_count / total_households)
+            if total_households > 0 else 0.0
+        )
+
         category_market_snapshot = self._build_category_market_snapshot()
 
         for household in self.households:
             # Plan labor supply
-            labor_plan = household.plan_labor_supply(gov_benefit)
+            labor_plan = household.plan_labor_supply(
+                gov_benefit,
+                global_unemployment_rate=global_unemployment_rate
+            )
             household_labor_plans[household.household_id] = labor_plan
 
             # Plan consumption
@@ -157,7 +167,9 @@ class Economy:
 
             household.apply_labor_outcome(
                 household_labor_outcomes[household.household_id],
-                market_wage_anchor=anchor
+                market_wage_anchor=anchor,
+                unemployment_benefit=gov_benefit,
+                current_tick=self.current_tick
             )
 
         # Phase 5: Firms apply production and costs
@@ -299,15 +311,25 @@ class Economy:
         Returns:
             Tuple of (firm_labor_outcomes, household_labor_outcomes)
         """
-        firm_labor_outcomes = {}
-        household_labor_outcomes = {}
+        firm_labor_outcomes: Dict[int, Dict] = {}
+        household_labor_outcomes: Dict[int, Dict] = {}
         assigned_households = set()
+        household_lookup = {h.household_id: h for h in self.households}
 
         # Track current employers to keep existing matches unless layoffs occur
         firm_lookup = {firm.firm_id: firm for firm in self.firms}
         planned_layoffs_set = set()
         for plan in firm_production_plans.values():
             planned_layoffs_set.update(plan.get("planned_layoffs_ids", []))
+
+        # Initialize firm outcomes
+        for firm in self.firms:
+            plan = firm_production_plans.get(firm.firm_id, {})
+            firm_labor_outcomes[firm.firm_id] = {
+                "hired_households_ids": [],
+                "confirmed_layoffs_ids": plan.get("planned_layoffs_ids", []),
+                "actual_wages": {}
+            }
 
         for household in self.households:
             if household.is_employed and household.household_id not in planned_layoffs_set:
@@ -347,14 +369,6 @@ class Economy:
 
             vacancies = production_plan["planned_hires_count"]
             wage_offer = wage_plan["wage_offer_next"]
-            confirmed_layoffs = production_plan["planned_layoffs_ids"]
-
-            # Initialize firm outcome
-            firm_labor_outcomes[firm_id] = {
-                "hired_households_ids": [],
-                "confirmed_layoffs_ids": confirmed_layoffs,
-                "actual_wages": {}
-            }
 
             if vacancies <= 0:
                 continue
@@ -362,13 +376,36 @@ class Economy:
             # Find eligible candidates
             eligible_candidates = []
             for household_id, labor_plan in household_labor_plans.items():
+                household = household_lookup.get(household_id)
+                if household is None:
+                    continue
+
                 # Skip if already assigned
-                if household_id in assigned_households:
+                is_currently_employed = (
+                    household.is_employed and household.household_id not in planned_layoffs_set
+                )
+                current_employer = household.employer_id if is_currently_employed else None
+
+                switch_allowed = False
+                if is_currently_employed:
+                    since_change = self.current_tick - household.last_job_change_tick
+                    failing_firm = False
+                    if current_employer in firm_lookup:
+                        employer_firm = firm_lookup[current_employer]
+                        failing_firm = (current_employer in planned_layoffs_set) or (employer_firm.cash_balance < 0)
+                    raise_threshold = 1.20  # require ~20% improvement to poach
+                    if (since_change >= household.job_switch_cooldown and
+                            wage_offer >= household.wage * raise_threshold):
+                        switch_allowed = True
+                    if failing_firm and wage_offer >= household.wage:
+                        switch_allowed = True
+
+                if household_id in assigned_households and not switch_allowed:
                     continue
 
                 # Check eligibility
                 if (labor_plan["searching_for_job"] and
-                    wage_offer >= labor_plan["reservation_wage"]):
+                    wage_offer >= labor_plan["reservation_wage"]) or switch_allowed:
                     eligible_candidates.append({
                         "household_id": household_id,
                         "skills_level": labor_plan["skills_level"]
@@ -386,7 +423,7 @@ class Economy:
                 skills_level = eligible_candidates[i]["skills_level"]
 
                 # Get household to check experience
-                household = next(h for h in self.households if h.household_id == household_id)
+                household = household_lookup[household_id]
 
                 # Calculate skill premium (50% max for skill level 1.0)
                 skill_premium = skills_level * 0.5
@@ -404,6 +441,14 @@ class Economy:
                 firm_labor_outcomes[firm_id]["hired_households_ids"].append(household_id)
                 firm_labor_outcomes[firm_id]["actual_wages"][household_id] = actual_wage
                 assigned_households.add(household_id)
+
+                # If switching, mark departure from previous employer
+                previous_employer = household.employer_id
+                if (previous_employer is not None and previous_employer != firm_id
+                        and previous_employer in firm_labor_outcomes):
+                    firm_labor_outcomes[previous_employer]["confirmed_layoffs_ids"].append(household_id)
+                    if household_id in firm_labor_outcomes[previous_employer]["actual_wages"]:
+                        del firm_labor_outcomes[previous_employer]["actual_wages"][household_id]
 
                 # Update household outcome
                 household_labor_outcomes[household_id] = {
@@ -651,52 +696,47 @@ class Economy:
         if len(firm.employees) == 0:
             return 0.0
 
-        # Calculate average productivity multiplier for the workforce
-        total_productivity_multiplier = 0.0
+        worker_count = len(firm.employees)
+        planned_per_worker = planned_production_units / worker_count
+        min_output_per_worker = max(0.0, 0.25 * firm.productivity_per_worker)
+
+        total_output = 0.0
         for employee_id in firm.employees:
             # Find the household
             household = next((h for h in self.households if h.household_id == employee_id), None)
             if household is None:
                 # Employee not found (shouldn't happen, but handle gracefully)
-                total_productivity_multiplier += 1.0
-                continue
+                productivity_multiplier = 1.0
+            else:
 
-            # Base multiplier is 1.0
-            productivity_multiplier = 1.0
+                # Base multiplier is 1.0
+                productivity_multiplier = 1.0
 
-            # Add skill bonus (max 25% for skills_level = 1.0)
-            skill_bonus = household.skills_level * 0.25
+                # Add skill bonus (max 25% for skills_level = 1.0)
+                skill_bonus = household.skills_level * 0.25
 
-            # Add experience bonus (5% per year, capped at 50%)
-            experience_ticks = household.category_experience.get(firm.good_category, 0)
-            experience_years = experience_ticks / 52.0
-            experience_bonus = min(experience_years * 0.05, 0.5)
+                # Add experience bonus (5% per year, capped at 50%)
+                experience_ticks = household.category_experience.get(firm.good_category, 0)
+                experience_years = experience_ticks / 52.0
+                experience_bonus = min(experience_years * 0.05, 0.5)
 
-            # Add wellbeing performance bonus (happiness/morale/health)
-            # Performance multiplier ranges from 0.5x (low wellbeing) to 1.5x (high wellbeing)
-            wellbeing_multiplier = household.get_performance_multiplier()
+                # Add wellbeing performance bonus (happiness/morale/health)
+                # Performance multiplier ranges from 0.5x (low wellbeing) to 1.5x (high wellbeing)
+                wellbeing_multiplier = household.get_performance_multiplier()
 
-            # Combine all factors
-            productivity_multiplier += skill_bonus + experience_bonus
-            productivity_multiplier *= wellbeing_multiplier
+                # Combine all factors
+                productivity_multiplier += skill_bonus + experience_bonus
+                productivity_multiplier *= wellbeing_multiplier
 
-            total_productivity_multiplier += productivity_multiplier
+            # Apply government infrastructure multiplier per worker
+            productivity_multiplier *= self.government.infrastructure_productivity_multiplier
 
-        # Calculate average productivity multiplier
-        avg_productivity_multiplier = total_productivity_multiplier / len(firm.employees)
+            per_worker_output = planned_per_worker * productivity_multiplier
+            per_worker_output = max(per_worker_output, min_output_per_worker)
+            total_output += per_worker_output
 
-        # Apply government infrastructure multiplier
-        # Government infrastructure investment boosts all productivity economy-wide
-        avg_productivity_multiplier *= self.government.infrastructure_productivity_multiplier
-
-        # Apply to planned production
         # Cap at production capacity
-        actual_production = min(
-            planned_production_units * avg_productivity_multiplier,
-            firm.production_capacity_units
-        )
-
-        return actual_production
+        return min(total_output, firm.production_capacity_units)
 
     def _handle_firm_exits(self) -> None:
         """

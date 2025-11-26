@@ -67,6 +67,8 @@ class HouseholdAgent:
     morale: float = 0.7  # 0-1 scale, affects work performance
     health: float = 1.0  # 0-1 scale, affects productivity and skill development
     unemployment_duration: int = 0  # consecutive ticks without employment
+    last_job_change_tick: int = -100000  # track last job change to enforce cooldown
+    job_switch_cooldown: int = 4  # minimum ticks between voluntary switches
 
     # Wellbeing dynamics
     happiness_decay_rate: float = 0.01  # Happiness naturally decays without maintenance
@@ -332,7 +334,11 @@ class HouseholdAgent:
             if hasattr(self, key):
                 setattr(self, key, value)
 
-    def plan_labor_supply(self, unemployment_benefit: float) -> Dict[str, object]:
+    def plan_labor_supply(
+        self,
+        unemployment_benefit: float,
+        global_unemployment_rate: float = 0.0
+    ) -> Dict[str, object]:
         """
         Decide whether to search for job and what wage to require.
 
@@ -340,6 +346,7 @@ class HouseholdAgent:
 
         Args:
             unemployment_benefit: Government support for unemployed
+            global_unemployment_rate: Current economy-wide unemployment rate [0,1]
 
         Returns:
             Dict with household_id, searching_for_job, reservation_wage, skills_level
@@ -355,6 +362,13 @@ class HouseholdAgent:
         else:
             # Comfortable: can be pickier, nudge toward expected wage
             reservation_wage_for_tick = 0.7 * baseline_reservation + 0.3 * self.expected_wage
+
+        # Additional downward pressure when unemployment persists or economy-wide unemployment is high
+        duration_pressure = min(0.3, self.unemployment_duration * 0.01)
+        macro_pressure = min(0.2, max(0.0, global_unemployment_rate - 0.2))
+        total_pressure = min(0.4, duration_pressure + macro_pressure)
+        reservation_wage_for_tick *= max(0.6, 1.0 - total_pressure)
+        reservation_wage_for_tick = max(reservation_wage_for_tick, 1.0)
 
         # Decide if searching
         searching_for_job = not self.is_employed
@@ -474,7 +488,9 @@ class HouseholdAgent:
     def apply_labor_outcome(
         self,
         outcome: Dict[str, object],
-        market_wage_anchor: Optional[float] = None
+        market_wage_anchor: Optional[float] = None,
+        unemployment_benefit: float = 0.0,
+        current_tick: int = 0
     ) -> None:
         """
         Update employment status and wage beliefs based on labor market outcome.
@@ -484,10 +500,15 @@ class HouseholdAgent:
         Args:
             outcome: Dict with employer_id (int | None), wage (float), and employer_category (str | None)
             market_wage_anchor: Optional market-paid wage to nudge expectations toward
+            unemployment_benefit: Current unemployment support level to anchor long-term expectations
+            current_tick: Simulation tick to support job switch cooldown tracking
         """
+        previous_employer = self.employer_id
         self.employer_id = outcome["employer_id"]
         self.wage = outcome["wage"]
         employer_category = outcome.get("employer_category", None)
+        if previous_employer != self.employer_id:
+            self.last_job_change_tick = current_tick
 
         # Track experience in category (increment by 1 tick if employed)
         if self.is_employed:
@@ -514,21 +535,32 @@ class HouseholdAgent:
             duration_pressure = min(0.35, self.unemployment_duration * 0.01)
             happiness_gap = max(0.0, 0.7 - self.happiness)
             happiness_pressure = min(0.3, happiness_gap * 0.5)
-            base_decay = 0.97  # slightly faster baseline decay
+            base_decay = 0.95  # ~5% baseline decay per tick
             decay_factor = max(
                 0.5,
                 base_decay - duration_pressure - happiness_pressure
             )
             decayed_expectation = max(self.expected_wage * decay_factor, 10.0)
 
+            # Pull toward benefit baseline when unemployed, especially with low experience
+            benefit_anchor = max(unemployment_benefit * self.reservation_markup_over_benefit, 10.0)
+            total_experience = sum(self.category_experience.values())
+            low_experience = total_experience < 26  # less than ~half a year
+            benefit_pull = min(0.6, 0.2 + 0.01 * self.unemployment_duration)
+            if low_experience:
+                benefit_pull = max(benefit_pull, 0.4)
+            self.expected_wage = (
+                (1.0 - benefit_pull) * decayed_expectation
+                + benefit_pull * benefit_anchor
+            )
+
+            # Optionally blend toward current market wages
             if market_wage_anchor is not None:
-                anchor_weight = 0.4  # stronger pull toward market when unemployed
+                anchor_weight = 0.4  # pull toward market when unemployed
                 self.expected_wage = (
-                    (1.0 - anchor_weight) * decayed_expectation
+                    (1.0 - anchor_weight) * self.expected_wage
                     + anchor_weight * market_wage_anchor
                 )
-            else:
-                self.expected_wage = decayed_expectation
 
         # Update reservation wage toward expected wage (slow adjustment)
         reservation_adjustment_rate = 0.1
