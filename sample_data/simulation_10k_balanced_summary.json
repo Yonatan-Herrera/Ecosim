@@ -1,62 +1,42 @@
 {
   "simulation_info": {
-    "num_ticks": 500,
+    "num_ticks": 200,
     "num_households": 10000,
-    "num_firms_initial": 18,
-    "num_firms_final": 18,
-    "total_simulation_time_seconds": 724.6571950912476,
-    "average_tick_time_seconds": 1.4223361263275147
+    "num_firms_initial": 33,
+    "num_firms_final": 33,
+    "total_simulation_time_seconds": 88.305340051651,
+    "average_tick_time_seconds": 1.7330651378631592
   },
   "final_state": {
-    "tick": 499,
-    "unemployment_rate": 0.6516,
-    "mean_wage": 54.30041481529829,
-    "median_wage": 43.67785817085399,
-    "mean_household_cash": 77.40167049503908,
-    "median_household_cash": 71.42857142857143,
-    "mean_happiness": 0.3402008249999999,
-    "mean_morale": 0.03647800000000001,
-    "mean_health": 1.0,
-    "government_cash": -92289508.18144792,
-    "total_firm_cash": 139769503.20921677
+    "tick": 49,
+    "unemployment_rate": 0.9463,
+    "mean_wage": 91.58971222520967,
+    "median_wage": 83.0001522229388,
+    "mean_household_cash": 249.87640380282738,
+    "median_household_cash": 214.89108404259025,
+    "mean_happiness": 0.02523379999999972,
+    "mean_morale": 0.02108200000000002,
+    "mean_health": 0.1997445300000021,
+    "government_cash": 17738653.911100373,
+    "total_firm_cash": 52075082.050871484
   },
   "database_stats": {
-    "households_rows": 510000,
-    "firms_rows": 1274,
-    "government_rows": 51
+    "households_rows": 60000,
+    "firms_rows": 198,
+    "government_rows": 6
   },
   "time_series_sample": {
     "ticks": [
-      0,
-      100,
-      200,
-      300,
-      400,
-      499
+      0
     ],
     "unemployment_rate": [
-      0.9937,
-      0.9336,
-      0.8576,
-      0.7781,
-      0.7191000000000001,
-      0.6516
+      0.9955
     ],
     "mean_wage": [
-      63.26583142857144,
-      193.3757492807029,
-      148.10832826040166,
-      79.95855392160784,
-      61.80601945709048,
-      54.30041481529829
+      70.86554716666666
     ],
     "mean_happiness": [
-      0.643485,
-      0.0664441999999997,
-      0.14858757499999894,
-      0.22558242499999898,
-      0.2874949999999993,
-      0.3402008249999999
+      0.6433750000001011
     ]
   }
 }
