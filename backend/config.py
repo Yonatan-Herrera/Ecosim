@@ -24,6 +24,7 @@ class HouseholdBehaviorConfig:
     min_savings_rate: float = 0.1  # 10% minimum savings
     max_savings_rate: float = 0.6  # 60% maximum savings
     personality_buckets: int = 6  # Number of savings personality types
+    unemployment_spend_sensitivity: float = 0.8
 
     # Wealth-based Saving Rate (NEW - for compute_saving_rate method)
     low_wealth_reference: float = 0.0  # Minimum wealth for saving calculation
@@ -32,6 +33,27 @@ class HouseholdBehaviorConfig:
     # Unemployment-based spending (NEW)
     min_spend_fraction: float = 0.3  # Spend 30% when scared
     confidence_multiplier: float = 0.5  # Up to 80% when confident
+
+    # Subsistence spending floor (prevents hoarding during crisis)
+    subsistence_min_cash: float = 50.0  # Always spend at least this much if available
+    max_spend_fraction: float = 0.9  # Upper bound on discretionary spending fraction
+
+    # Job acceptance (H1 - no job worse than benefits)
+    min_job_premium_over_unemployment: float = 1.05  # Jobs must pay 5% more than unemployment benefits
+
+    # Marginal propensity to consume (H2 - spend from income vs cash)
+    mpc_from_wages_employed: float = 0.6  # Employed: save 40% of wages
+    mpc_from_transfers_unemployed: float = 0.8  # Unemployed: spend 80% of transfers
+
+    # Saving behavior (H3 - employed vs unemployed)
+    max_saving_rate_absolute: float = 0.2  # Hard cap on saving rate
+    unemployed_forced_dissaving_wealth: float = 1000.0  # Below this, long-term unemployed can't save
+    unemployed_forced_dissaving_duration: float = 50.0  # Ticks before forced dissaving kicks in
+
+    # Job search intensity (H5 - happiness link)
+    base_search_intensity: float = 1.0  # Baseline job search effort
+    min_search_intensity: float = 0.5  # Minimum (happy & comfortable)
+    max_search_intensity: float = 2.0  # Maximum (desperate)
 
     # Price Elasticity (NEW - Prompt 4)
     food_elasticity: float = 0.5  # Inelastic (necessity)
@@ -159,10 +181,36 @@ class FirmBehaviorConfig:
     default_productivity_per_worker: float = 10.0
     default_units_per_worker: float = 20.0
 
-    # Diminishing Returns (NEW - Prompt 5)
-    production_scaling_exponent: float = 0.9  # Non-linear production
+    # Diminishing Returns / Productivity
+    production_scaling_exponent: float = 0.9  # Legacy exponent (deprecated)
+    diminishing_returns_exponent: float = 0.82  # Unified exponent for capacity/productivity (0.80-0.85)
     min_base_productivity: float = 1.0
     min_target_workers: int = 1
+    expected_skill_premium: float = 0.3  # Anticipated wage premium over offer
+    min_skeleton_workers: int = 3
+    minimum_wage_floor: float = 20.0
+    min_labor_share: float = 0.5
+    max_labor_share: float = 0.8
+    burn_mode_grace_period: int = 15
+    high_inventory_factor_small: float = 1.5
+    high_inventory_factor_large: float = 2.5
+    burn_mode_trigger_streak_small: int = 5
+    burn_mode_trigger_streak_large: int = 15
+    burn_mode_exit_streak: int = 2
+    inventory_exit_epsilon: float = 5.0
+    min_expected_sales: float = 10.0
+    large_market_inventory_relief: float = 1.3
+    large_market_burn_mode_buffer: int = 5
+    burn_mode_relief_rate: int = 2
+    burn_mode_staff_reduction_factor: float = 0.65
+    burn_mode_idle_production_fraction: float = 0.05
+    target_labor_share: float = 0.65
+    margin_low: float = 0.05
+    margin_high: float = 0.20
+    target_firms_per_1000_households: int = 30
+    max_new_firms_per_tick: int = 10
+    large_market_household_threshold: int = 2000
+    housing_private_saturation_multiplier: float = 3.0
 
     # Pricing & Costs
     default_unit_cost: float = 5.0
@@ -183,8 +231,8 @@ class FirmBehaviorConfig:
 
     # R&D and Quality
     default_rd_spending_rate: float = 0.05  # 5% of revenue
-    quality_improvement_per_rd_dollar: float = 0.01
-    quality_decay_rate: float = 0.02
+    quality_improvement_per_rd_dollar: float = 0.0002  # Slowed down 50x (was 0.01)
+    quality_decay_rate: float = 0.0  # Quality decay removed
     quality_min: float = 0.0
     quality_max: float = 10.0
 
@@ -207,6 +255,12 @@ class FirmBehaviorConfig:
     successful_hiring_wage_reduction: float = 0.05
     no_pressure_wage_drift: float = 0.02
     minimum_wage: float = 1.0
+
+    # Wage Stabilization (prevent explosive wage growth)
+    max_wage_increase_per_tick: float = 1.15  # Max +15% per tick
+    max_wage_decrease_per_tick: float = 0.85  # Max -15% per tick
+    unemployment_damping_min: float = 0.3  # Minimum damping factor at high unemployment
+    unemployment_damping_rate: float = 0.8  # How much unemployment reduces wage pressure
 
     # Dividend Distribution
     dividend_cost_reserve_ticks: float = 3.0  # Retain 3 ticks of costs
@@ -250,9 +304,13 @@ class GovernmentPolicyConfig:
     # Tax & Transfer Rates
     default_wage_tax_rate: float = 0.15
     default_profit_tax_rate: float = 0.20
+    default_investment_tax_rate: float = 0.10  # Tax on R&D and capital investments
     default_unemployment_benefit: float = 30.0
     default_min_cash_threshold: float = 100.0
     default_transfer_budget: float = 10000.0
+
+    # Wage Floor Policy (minimum wage tied to unemployment benefit)
+    wage_floor_multiplier: float = 1.2  # Minimum wage = unemployment_benefit × 1.2
 
     # Investment Budgets
     infrastructure_investment_budget: float = 1000.0
@@ -264,6 +322,26 @@ class GovernmentPolicyConfig:
     initial_infrastructure_multiplier: float = 1.0
     initial_technology_multiplier: float = 1.0
     initial_social_multiplier: float = 1.0
+    infra_multiplier_target: float = 1.5
+    social_multiplier_target: float = 1.5
+    infra_multiplier_hard_cap: float = 2.0
+    social_multiplier_hard_cap: float = 2.0
+    investment_speed: float = 0.02
+    unemployment_cutoff_for_investment: float = 0.3
+    emergency_loan_trigger: float = 0.08
+    emergency_loan_amount: float = 75000.0
+    emergency_loan_cash_threshold: float = 40000.0
+    emergency_loan_interest: float = 0.01
+    emergency_loan_fraction_of_cash: float = 0.05
+    emergency_loan_term_years: float = 2.0
+    emergency_loan_required_headcount_multiplier: float = 1.3
+    emergency_loan_min_headcount: int = 12
+    emergency_loan_enforcement_ticks: int = 26
+    emergency_loan_penalty_reclaim_fraction: float = 1.0
+    public_works_unemployment_threshold: float = 0.25
+    public_works_job_fraction: float = 0.2
+    public_works_wage: float = 45.0
+    public_works_price: float = 1.0
 
     # Investment Effects
     infrastructure_gain_divisor: float = 1000.0  # $1000 → 0.5% productivity
@@ -353,6 +431,16 @@ class MarketMechanicsConfig:
 
 
 @dataclass
+class DebugConfig:
+    """Debug and anomaly detection settings."""
+
+    # H4: Household income anomaly detection
+    large_household_net_change: float = 10000.0  # Flag cash changes above this threshold
+    enable_income_tracking: bool = True  # Track wage/transfer/dividend breakdown
+    log_large_changes: bool = False  # Log anomalous household income changes
+
+
+@dataclass
 class SimulationConfig:
     """Master configuration for the entire simulation."""
 
@@ -363,6 +451,7 @@ class SimulationConfig:
     government: GovernmentPolicyConfig = field(default_factory=GovernmentPolicyConfig)
     labor_market: LaborMarketConfig = field(default_factory=LaborMarketConfig)
     market: MarketMechanicsConfig = field(default_factory=MarketMechanicsConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
 
     # Simulation Scale (Legacy - kept for backward compatibility)
     num_households: int = 10000

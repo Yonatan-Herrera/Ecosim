@@ -5,6 +5,7 @@ This script creates a larger economy and runs it for a specified number of ticks
 Progress is printed every 10 ticks to monitor performance and economic indicators.
 """
 
+import argparse
 import json
 import sqlite3
 import time
@@ -15,6 +16,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from agents import HouseholdAgent, FirmAgent, GovernmentAgent
+from config import CONFIG
 from economy import Economy
 
 
@@ -51,7 +53,8 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
     }
 
     # Create firms
-    firms: List[FirmAgent] = []
+    baseline_firms: List[FirmAgent] = []
+    queued_firms: List[FirmAgent] = []
     next_firm_id = 1
 
     # Create baseline firms (government-controlled "safety net")
@@ -59,11 +62,12 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
     # They should serve as a fallback option, not dominate the market
     print(f"Creating {len(essential_categories)} baseline firms...")
     for category in essential_categories:
+        baseline_units = np.random.randint(0, 51) if category == "Housing" else 0
         baseline_firm = FirmAgent(
             firm_id=next_firm_id,
             good_name=f"Baseline{category}",
             cash_balance=2_000_000.0,  # Reduced from 10M - still comfortable but not infinite
-            inventory_units=20_000.0,   # Reduced from 100k - modest starting inventory
+            inventory_units=0.0 if category == "Housing" else 20_000.0,
             good_category=category,
             quality_level=3.0,          # LOW quality (on 0-10 scale) - government basic goods
             wage_offer=25.0,
@@ -74,29 +78,47 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
             productivity_per_worker=12.0,  # Lower productivity than private firms
             personality="conservative",
             is_baseline=True,
-            baseline_production_quota=num_households * 0.15  # Reduced quota
+            baseline_production_quota=num_households * 0.15,  # Reduced quota
+            max_rental_units=baseline_units
         )
         baseline_firm.set_personality("conservative")
         gov.register_baseline_firm(category, baseline_firm.firm_id)
-        firms.append(baseline_firm)
+        baseline_firms.append(baseline_firm)
         next_firm_id += 1
 
     # Create competitive private firms (HIGHER quality than government)
-    print(f"Creating {num_firms_per_category * len(essential_categories)} competitive firms...")
+    target_total_firms = max(
+        len(baseline_firms),
+        int((num_households / 1000.0) * CONFIG.firms.target_firms_per_1000_households)
+    )
+    print(f"Target total firms based on population: {target_total_firms}")
+    print(f"Creating competitive firms...")
     personalities = ["aggressive", "moderate", "conservative"]
 
-    for category in essential_categories:
-        for i in range(num_firms_per_category):
-            personality = personalities[i % len(personalities)]
+    private_needed = max(
+        len(essential_categories) * num_firms_per_category,
+        target_total_firms - len(baseline_firms)
+    )
+    per_category = private_needed // len(essential_categories)
+    remainder = private_needed % len(essential_categories)
+
+    for idx, category in enumerate(essential_categories):
+        firms_in_category = per_category + (1 if idx < remainder else 0)
+        for i in range(firms_in_category):
+            personality = personalities[(i + idx) % len(personalities)]
+            quality_seed = 5.0 + (i * 0.3)
+            quality_level = max(1.0, min(10.0, quality_seed))
+            price_multiplier = max(0.5, min(3.0, 0.95 + i * 0.03))
+            wage_offer = min(200.0, 25.0 + (i * 3.0))
             competitive_firm = FirmAgent(
                 firm_id=next_firm_id,
                 good_name=f"{category}Co{i+1}",
                 cash_balance=800_000.0,  # Increased from 500k - competitive with baseline
-                inventory_units=8_000.0,  # Increased starting inventory
+                inventory_units=300.0,  # Smaller starting inventory to avoid instant glut
                 good_category=category,
-                quality_level=5.0 + (i * 0.3),  # HIGHER quality: 5.0-7.7 (vs baseline 3.0)
-                wage_offer=25.0 + (i * 3.0),    # Higher wages to attract talent
-                price=baseline_prices.get(category, 5.0) * (0.95 + i * 0.03),  # Competitive pricing
+                quality_level=quality_level,
+                wage_offer=wage_offer,
+                price=baseline_prices.get(category, 5.0) * price_multiplier,
                 expected_sales_units=num_households * 0.03,
                 production_capacity_units=60_000.0,  # Better capacity
                 units_per_worker=40.0,
@@ -105,7 +127,7 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
                 is_baseline=False
             )
             competitive_firm.set_personality(personality)
-            firms.append(competitive_firm)
+            queued_firms.append(competitive_firm)
             next_firm_id += 1
 
     # Create households with distributed characteristics
@@ -135,14 +157,40 @@ def create_large_economy(num_households: int = 10000, num_firms_per_category: in
         if (i + 1) % 1000 == 0:
             print(f"  Created {i + 1}/{num_households} households...")
 
+    # Assign owners to firms (1-3 households per firm)
+    # This creates a wealth recycling mechanism where firm profits flow back to households
+    print(f"Assigning ownership of {len(baseline_firms) + len(queued_firms)} firms...")
+    import random
+    random.seed(42)  # Deterministic for reproducibility
+
+    for firm in baseline_firms + queued_firms:
+        # Randomly assign 1-3 owners per firm
+        num_owners = random.randint(1, 3)
+        # Select owners from household population
+        owner_ids = random.sample(range(num_households), num_owners)
+        firm.owners = owner_ids
+
+    total_firms = len(baseline_firms) + len(queued_firms)
+    print(f"✓ Ownership assigned (avg {sum(len(f.owners) for f in baseline_firms + queued_firms) / total_firms:.1f} owners/firm)")
+
     print(f"✓ Economy created successfully!")
-    print(f"  Total agents: {len(households) + len(firms) + 1}")
+    print(f"  Total agents: {len(households) + len(baseline_firms) + 1}")
     print(f"    - Households: {len(households)}")
-    print(f"    - Firms: {len(firms)}")
+    print(f"    - Firms: {len(baseline_firms)} (queued: {len(queued_firms)})")
     print(f"    - Government: 1")
     print()
 
-    return Economy(households=households, firms=firms, government=gov)
+    economy = Economy(
+        households=households,
+        firms=baseline_firms,
+        government=gov,
+        queued_firms=queued_firms
+    )
+    economy.target_total_firms = max(
+        len(economy.firms) + len(economy.queued_firms),
+        target_total_firms
+    )
+    return economy
 
 
 def init_database(db_path: str):
@@ -169,6 +217,8 @@ def init_database(db_path: str):
             food_experience INTEGER,
             housing_experience INTEGER,
             services_experience INTEGER,
+            unemployment_duration INTEGER,
+            reservation_wage REAL,
             PRIMARY KEY (tick, household_id)
         )
     """)
@@ -223,14 +273,17 @@ def init_database(db_path: str):
             mean_wage REAL,
             median_wage REAL,
             mean_household_cash REAL,
-            median_household_cash REAL,
+
+                             median_household_cash REAL,
             mean_happiness REAL,
             mean_morale REAL,
             mean_health REAL,
             mean_performance REAL,
             total_firm_cash REAL,
             mean_price REAL,
-            government_cash REAL
+            government_cash REAL,
+            gdp_this_tick REAL,
+            total_net_worth REAL
         )
     """)
 
@@ -311,11 +364,13 @@ def export_tick_data(
             h.get_performance_multiplier(),
             h.category_experience.get("Food", 0),
             h.category_experience.get("Housing", 0),
-            h.category_experience.get("Services", 0)
+            h.category_experience.get("Services", 0),
+            h.unemployment_duration,
+            h.reservation_wage
         ))
 
     cursor.executemany(
-        "INSERT INTO households VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO households VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         household_rows
     )
 
@@ -362,10 +417,15 @@ def export_tick_data(
     # Calculate and export aggregate metrics
     stats = household_stats or compute_household_stats(economy.households)
     total_firm_cash = sum(f.cash_balance for f in economy.firms)
+    total_household_cash = sum(h.cash_balance for h in economy.households)
+    total_net_worth = total_household_cash + total_firm_cash + gov.cash_balance
     mean_price = sum(f.price for f in economy.firms) / len(economy.firms) if economy.firms else 0.0
 
+    # Calculate GDP (sum of firm revenues this tick)
+    gdp_this_tick = sum(economy.last_tick_revenue.values())
+
     cursor.execute(
-        "INSERT INTO aggregate_metrics VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO aggregate_metrics VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             tick,
             len(economy.households),
@@ -381,25 +441,27 @@ def export_tick_data(
             stats["mean_performance"],
             total_firm_cash,
             mean_price,
-            gov.cash_balance
+            gov.cash_balance,
+            gdp_this_tick,
+            total_net_worth
         )
     )
 
     conn.commit()
 
 
-def main():
-    """Run large-scale simulation."""
+def main(
+    num_households: int = 10000,
+    num_firms_per_category: int = 10,
+    num_ticks: int = 500,
+    export_every: int = 50,
+    output_tag: str = "10k_balanced"
+):
+    """Run EcoSim simulation with configurable size."""
     print("=" * 80)
-    print("ECOSIM LARGE-SCALE SIMULATION (10,000 AGENTS)")
+    print(f"ECOSIM SIMULATION ({num_households:,} households, {num_ticks} ticks)")
     print("=" * 80)
     print()
-
-    # Configuration
-    NUM_HOUSEHOLDS = 10000
-    NUM_FIRMS_PER_CATEGORY = 10
-    NUM_TICKS = 500  # Run for 500 ticks to see dynamics
-    EXPORT_EVERY_N_TICKS = 10  # Export to DB every 10 ticks
 
     # Create output directory
     output_dir = Path("sample_data")
@@ -407,13 +469,28 @@ def main():
 
     # Create economy
     start_time = time.time()
-    economy = create_large_economy(NUM_HOUSEHOLDS, NUM_FIRMS_PER_CATEGORY)
+    economy = create_large_economy(num_households, num_firms_per_category)
     creation_time = time.time() - start_time
     print(f"Economy creation time: {creation_time:.2f} seconds")
     print()
 
+    # Select sample households and firms to track
+    sample_household_ids = [0, num_households // 10, num_households // 2,
+                           3 * num_households // 4, num_households - 1]
+    sample_firm_ids = []
+    if len(economy.firms) >= 5:
+        # Track first 3 baseline firms + 2 random private firms
+        sample_firm_ids = [f.firm_id for f in economy.firms[:3]]
+        if len(economy.firms) > 3:
+            sample_firm_ids.extend([economy.firms[len(economy.firms)//2].firm_id,
+                                   economy.firms[-1].firm_id])
+
+    print(f"Tracking sample households: {sample_household_ids}")
+    print(f"Tracking sample firms: {sample_firm_ids[:5]}")
+    print()
+
     # Initialize database (remove existing file if present)
-    db_path = output_dir / "ecosim_10k_balanced.db"
+    db_path = output_dir / f"ecosim_{output_tag}.db"
     if db_path.exists():
         db_path.unlink()  # Delete existing database
         print(f"Removed existing database: {db_path}")
@@ -425,8 +502,8 @@ def main():
     db_conn = sqlite3.connect(str(db_path))
 
     # Run simulation
-    print(f"Running simulation for {NUM_TICKS} ticks...")
-    print(f"(Exporting to database every {EXPORT_EVERY_N_TICKS} ticks)")
+    print(f"Running simulation for {num_ticks} ticks...")
+    print(f"(Exporting to database every {export_every} ticks)")
     print()
     print("Tick | Time(s) | Firms | Unemploy |   Happiness | Avg Wage | Gov Cash")
     print("-" * 80)
@@ -434,7 +511,10 @@ def main():
     tick_time_history: deque[float] = deque(maxlen=10)
     tick_time_sum = 0.0
 
-    for tick in range(NUM_TICKS):
+    # Track sample households and firms every 100 ticks for detailed output
+    sample_snapshots = []
+
+    for tick in range(num_ticks):
         tick_start = time.time()
 
         # Step economy
@@ -446,11 +526,43 @@ def main():
         household_stats = compute_household_stats(economy.households)
 
         # Export data periodically
-        if tick % EXPORT_EVERY_N_TICKS == 0 or tick == NUM_TICKS - 1:
+        if tick % export_every == 0 or tick == num_ticks - 1:
             export_tick_data(economy, tick, db_conn, household_stats)
 
+        # Capture sample snapshots every 100 ticks
+        if tick % 100 == 0 or tick == num_ticks - 1:
+            snapshot = {"tick": tick, "households": [], "firms": []}
+
+            # Sample households
+            for hh_id in sample_household_ids:
+                hh = next((h for h in economy.households if h.household_id == hh_id), None)
+                if hh:
+                    snapshot["households"].append({
+                        "id": hh_id,
+                        "cash": hh.cash_balance,
+                        "employed": hh.is_employed,
+                        "wage": hh.wage if hh.is_employed else 0,
+                        "happiness": hh.happiness,
+                        "unemployment_duration": hh.unemployment_duration
+                    })
+
+            # Sample firms
+            for firm_id in sample_firm_ids:
+                firm = next((f for f in economy.firms if f.firm_id == firm_id), None)
+                if firm:
+                    snapshot["firms"].append({
+                        "id": firm_id,
+                        "name": firm.good_name,
+                        "cash": firm.cash_balance,
+                        "employees": len(firm.employees),
+                        "wage_offer": firm.wage_offer,
+                        "inventory": firm.inventory_units
+                    })
+
+            sample_snapshots.append(snapshot)
+
         # Print progress every 10 ticks
-        if tick % 10 == 0 or tick == NUM_TICKS - 1:
+        if tick % 10 == 0 or tick == num_ticks - 1:
             avg_tick_time = sum(tick_time_history) / len(tick_time_history)
 
             print(f"{tick:4d} | {avg_tick_time:7.3f} | {len(economy.firms):5d} | "
@@ -459,7 +571,7 @@ def main():
 
     print()
     total_time = time.time() - start_time
-    avg_tick_time = tick_time_sum / NUM_TICKS
+    avg_tick_time = tick_time_sum / num_ticks
 
     db_conn.close()
 
@@ -475,7 +587,7 @@ def main():
     conn = sqlite3.connect(str(db_path))
 
     # Query final state
-    final_tick = NUM_TICKS - 1
+    final_tick = num_ticks - 1
     final_metrics = conn.execute(
         "SELECT * FROM aggregate_metrics WHERE tick = ?", (final_tick,)
     ).fetchone()
@@ -487,8 +599,8 @@ def main():
 
     summary = {
         "simulation_info": {
-            "num_ticks": NUM_TICKS,
-            "num_households": NUM_HOUSEHOLDS,
+            "num_ticks": num_ticks,
+            "num_households": num_households,
             "num_firms_initial": len(economy.firms),
             "num_firms_final": final_metrics[2] if final_metrics else 0,
             "total_simulation_time_seconds": total_time,
@@ -517,13 +629,18 @@ def main():
             "unemployment_rate": [row[1] for row in metrics_over_time[::10]],
             "mean_wage": [row[2] for row in metrics_over_time[::10]],
             "mean_happiness": [row[3] for row in metrics_over_time[::10]]
+        },
+        "sample_trajectories": {
+            "household_ids": sample_household_ids,
+            "firm_ids": sample_firm_ids,
+            "snapshots": sample_snapshots
         }
     }
 
     conn.close()
 
     # Save summary (remove existing file to avoid stale content)
-    summary_path = output_dir / "simulation_10k_balanced_summary.json"
+    summary_path = output_dir / f"simulation_{output_tag}_summary.json"
     if summary_path.exists():
         summary_path.unlink()
         print(f"Removed existing summary: {summary_path}")
@@ -532,21 +649,170 @@ def main():
 
     print(f"✓ Summary saved to: {summary_path}")
     print()
+
+    # Get comprehensive economic metrics from the economy
+    metrics = economy.get_economic_metrics()
+
     print("=" * 80)
-    print("SIMULATION SUMMARY")
+    print("📊 COMPREHENSIVE ECONOMIC DASHBOARD")
     print("=" * 80)
-    print(f"Total agents: {NUM_HOUSEHOLDS + len(economy.firms) + 1:,}")
-    print(f"Total ticks: {NUM_TICKS}")
-    print(f"Final unemployment rate: {summary['final_state']['unemployment_rate']:.1%}")
-    print(f"Final mean wage: ${summary['final_state']['mean_wage']:.2f}")
-    print(f"Final mean happiness: {summary['final_state']['mean_happiness']:.3f}")
-    print(f"Performance: {avg_tick_time*1000:.1f}ms per tick")
     print()
-    print("Files generated:")
-    print(f"  - {db_path}")
-    print(f"  - {summary_path}")
+
+    # GDP and Economic Output
+    print("📈 ECONOMIC OUTPUT")
+    print("-" * 80)
+    print(f"  Current tick GDP:             ${metrics['gdp_this_tick']:>15,.2f}")
+    print(f"  Total wealth (economy):       ${metrics['total_economy_cash']:>15,.2f}")
     print()
+
+    # Labor Market
+    print("👥 LABOR MARKET")
+    print("-" * 80)
+    print(f"  Total households:             {metrics['total_households']:>15,}")
+    print(f"  Employed:                     {metrics['employed_count']:>15,}")
+    print(f"  Unemployed:                   {metrics['unemployed_count']:>15,}")
+    print(f"  Unemployment rate:            {metrics['unemployment_rate']:>15.1%}")
+    print(f"  Average wage:                 ${metrics['mean_wage']:>14,.2f}")
+    print(f"  Median wage:                  ${metrics['median_wage']:>14,.2f}")
+    print(f"  Min wage:                     ${metrics['min_wage']:>14,.2f}")
+    print(f"  Max wage:                     ${metrics['max_wage']:>14,.2f}")
+    print()
+
+    # Household Wellbeing
+    print("😊 HOUSEHOLD WELLBEING")
+    print("-" * 80)
+    print(f"  Average happiness:            {metrics['mean_happiness']:>18.3f}")
+    print(f"  Average morale:               {metrics['mean_morale']:>18.3f}")
+    print(f"  Average health:               {metrics['mean_health']:>18.3f}")
+    print(f"  Average skills:               {metrics['mean_skills']:>18.3f}")
+    print()
+
+    # Household Finances
+    print("💰 HOUSEHOLD FINANCES")
+    print("-" * 80)
+    print(f"  Total household cash:         ${metrics['total_household_cash']:>15,.2f}")
+    print(f"  Average cash per household:   ${metrics['mean_household_cash']:>15,.2f}")
+    print(f"  Median cash per household:    ${metrics['median_household_cash']:>15,.2f}")
+    print()
+
+    # Firm Sector
+    print("🏢 FIRM SECTOR")
+    print("-" * 80)
+    print(f"  Active firms:                 {metrics['total_firms']:>18,}")
+    print(f"  Total firm cash:              ${metrics['total_firm_cash']:>15,.2f}")
+    print(f"  Average firm cash:            ${metrics['mean_firm_cash']:>15,.2f}")
+    print(f"  Median firm cash:             ${metrics['median_firm_cash']:>15,.2f}")
+    print(f"  Total inventory (units):      {metrics['total_firm_inventory']:>18,}")
+    print(f"  Total employees:              {metrics['total_employees']:>18,}")
+    print(f"  Average firm quality:         {metrics['mean_quality']:>18.2f}")
+    print(f"  Average firm price:           ${metrics['mean_price']:>14,.2f}")
+    print(f"  Median firm price:            ${metrics['median_price']:>14,.2f}")
+    print()
+
+    # Government
+    print("🏛️  GOVERNMENT FINANCES & POLICY")
+    print("-" * 80)
+    print(f"  Government cash:              ${metrics['government_cash']:>15,.2f}")
+    print(f"  Wage tax rate:                {metrics['wage_tax_rate']:>15.1%}")
+    print(f"  Profit tax rate:              {metrics['profit_tax_rate']:>15.1%}")
+    print(f"  Unemployment benefit:         ${metrics['unemployment_benefit']:>14,.2f}")
+    print(f"  Transfer budget:              ${metrics['transfer_budget']:>14,.2f}")
+    print(f"  Infrastructure multiplier:    {metrics['infrastructure_productivity']:>18.3f}")
+    print(f"  Technology multiplier:        {metrics['technology_quality']:>18.3f}")
+    print(f"  Social multiplier:            {metrics['social_happiness']:>18.3f}")
+    print()
+
+    # Performance
+    print("⚡ SIMULATION PERFORMANCE")
+    print("-" * 80)
+    print(f"  Total agents:                 {num_households + len(economy.firms) + 1:>15,}")
+    print(f"  Total ticks:                  {num_ticks:>18,}")
+    print(f"  Current tick:                 {metrics['current_tick']:>18,}")
+    print(f"  Total time:                   {total_time:>15.2f} seconds")
+    print(f"  Average time per tick:        {avg_tick_time*1000:>15.1f} ms")
+    print(f"  Ticks per second:             {1/avg_tick_time:>18.2f}")
+    print()
+
+    print("=" * 80)
+    print("📸 SAMPLE TRAJECTORIES (5 households, 5 firms)")
+    print("=" * 80)
+    print()
+
+    # Print household sample summary
+    print("HOUSEHOLD SAMPLES:")
+    for hh_id in sample_household_ids:
+        # Extract household data from snapshots
+        hh_data = []
+        for snapshot in sample_snapshots:
+            for h in snapshot["households"]:
+                if h["id"] == hh_id:
+                    hh_data.append(h)
+                    break
+
+        if hh_data:
+            first = hh_data[0]
+            last = hh_data[-1]
+            print(f"  HH {hh_id:4d}: ${first['cash']:7.2f} → ${last['cash']:7.2f} cash | "
+                  f"Employed: {first['employed']} → {last['employed']} | "
+                  f"Happiness: {first['happiness']:.2f} → {last['happiness']:.2f}")
+    print()
+
+    # Print firm sample summary
+    print("FIRM SAMPLES:")
+    if sample_firm_ids:
+        for firm_id in sample_firm_ids:
+            # Extract firm data from snapshots
+            firm_data = []
+            for snapshot in sample_snapshots:
+                for f in snapshot["firms"]:
+                    if f["id"] == firm_id:
+                        firm_data.append(f)
+                        break
+
+            if firm_data:
+                first = firm_data[0]
+                last = firm_data[-1]
+                print(f"  Firm {firm_id:3d} ({last['name']:20s}): "
+                      f"${first['cash']:10,.0f} → ${last['cash']:10,.0f} cash | "
+                      f"Employees: {first['employees']:3d} → {last['employees']:3d}")
+    else:
+        print("  No firms tracked in sample")
+    print()
+
+    print("=" * 80)
+    print("FILES GENERATED")
+    print("=" * 80)
+    print(f"  Database:  {db_path}")
+    print(f"  Summary:   {summary_path} (includes sample trajectories)")
+    print()
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run EcoSim simulation.")
+    parser.add_argument("--households", type=int, default=10000, help="Number of households")
+    parser.add_argument("--firms-per-category", type=int, default=10, help="Firms per category at creation")
+    parser.add_argument("--ticks", type=int, default=500, help="Number of ticks to run")
+    parser.add_argument("--export-every", type=int, default=50, help="Export interval (ticks)")
+    parser.add_argument("--tag", type=str, default="10k_balanced", help="Output tag for DB/summary filenames")
+    parser.add_argument(
+        "--small",
+        action="store_true",
+        help="Shortcut for a 1000-household, 200-tick diagnostic run"
+    )
+    args = parser.parse_args()
+
+    if args.small:
+        args.households = 1000
+        args.ticks = 500
+        args.export_every = max(10, args.export_every // 2)
+        if args.tag == "10k_balanced":
+            args.tag = "1k_test"
+
+    main(
+        num_households=args.households,
+        num_firms_per_category=args.firms_per_category,
+        num_ticks=args.ticks,
+        export_every=args.export_every,
+        output_tag=args.tag
+    )

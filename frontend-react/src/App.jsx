@@ -219,6 +219,97 @@ const TechSlider = ({ label, value, onChange, min, max, step, format = v => v })
   </div>
 );
 
+// --- REUSABLE CHART COMPONENT ---
+const LineChart = ({ title, data, color, minScale = 0, suffix = "", formatValue = v => v.toFixed(1) }) => {
+  // Normalize data to array of arrays for multi-line support
+  const datasets = Array.isArray(data[0]) ? data : [data];
+  const colors = Array.isArray(color) ? color : [color];
+
+  // Check if we have enough data in the primary dataset
+  if (!datasets[0] || datasets[0].length < 2) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-slate-600 font-mono text-xs border-l border-b border-slate-700/50 bg-slate-900/20">
+        {datasets[0] && datasets[0].length === 1 ? "CALCULATING..." : "WAITING..."}
+      </div>
+    );
+  }
+
+  // Calculate global min/max across all datasets
+  const allValues = datasets.flatMap(d => d.map(p => p.value));
+  const minVal = Math.min(...allValues, minScale);
+  const maxVal = Math.max(...allValues, minScale + 0.1);
+  const range = maxVal - minVal || 1;
+
+  // Zero line Y position
+  const zeroY = 100 - ((0 - minVal) / range) * 80 - 10;
+
+  // Get last value of primary dataset for display
+  const lastValue = datasets[0][datasets[0].length - 1].value;
+
+  return (
+    <div className="flex-1 relative border-l border-b border-slate-700/50 px-2 pb-0 overflow-hidden bg-slate-900/20 flex flex-col min-h-[140px]">
+      <div className="absolute top-2 left-3 z-10">
+        <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{title}</h4>
+        <div className="text-lg font-mono font-bold text-slate-200">
+          {formatValue(lastValue)}{suffix}
+        </div>
+      </div>
+
+      <div className="flex-1 relative w-full h-full">
+        <svg className="w-full h-full overflow-visible" preserveAspectRatio="none" viewBox="0 0 100 100">
+          {/* Grid Lines */}
+          {[0, 25, 50, 75, 100].map(p => (
+            <line key={p} x1="0" y1={p} x2="100" y2={p} stroke="#1e293b" strokeWidth="0.5" />
+          ))}
+
+          {/* Zero Line */}
+          {zeroY >= 0 && zeroY <= 100 && (
+            <line x1="0" y1={zeroY} x2="100" y2={zeroY} stroke="#475569" strokeWidth="0.5" strokeDasharray="2 2" />
+          )}
+
+          {/* Render each dataset */}
+          {datasets.map((dataset, dIdx) => {
+            const lineColor = colors[dIdx % colors.length];
+            const points = dataset.map((point, i) => {
+              const x = (i / (dataset.length - 1)) * 100;
+              const y = 100 - ((point.value - minVal) / range) * 80 - 10;
+              return `${x},${y}`;
+            }).join(' ');
+
+            return (
+              <g key={dIdx}>
+                <polyline points={points} fill="none" stroke={lineColor} strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+                {dataset.map((point, i) => {
+                  const x = (i / (dataset.length - 1)) * 100;
+                  const y = 100 - ((point.value - minVal) / range) * 80 - 10;
+
+                  return (
+                    <g key={i} className="group">
+                      {/* Invisible hit area for tooltip */}
+                      <circle cx={x} cy={y} r="3" fill="transparent" className="cursor-crosshair" />
+                      {/* Visible dot only on hover */}
+                      <circle cx={x} cy={y} r="2" fill={lineColor} className="opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
+
+                      {/* Tooltip (only for primary line to avoid clutter) */}
+                      {dIdx === 0 && (
+                        <foreignObject x={x - 20} y={y - 25} width="40" height="20" className="overflow-visible opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                          <div className="bg-slate-800 text-[10px] text-white px-1 py-0.5 rounded border border-slate-600 whitespace-nowrap text-center shadow-lg z-50">
+                            {formatValue(point.value)}{suffix}
+                          </div>
+                        </foreignObject>
+                      )}
+                    </g>
+                  );
+                })}
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+    </div>
+  );
+};
+
 export default function EcoSimUI() {
   const [activeView, setActiveView] = useState('CONFIG'); // Start at CONFIG
   const [isInitialized, setIsInitialized] = useState(false);
@@ -231,13 +322,24 @@ export default function EcoSimUI() {
 
   // Simulation State
   const [metrics, setMetrics] = useState({
-    unemployment: 99.0, // Start high
+    unemployment: 99.0,
     gdp: 0.0,
     govDebt: 0.0,
+    govProfit: 0.0,
     happiness: 50,
     housingInv: 0,
     avgWage: 0.0,
-    gdpHistory: [] // New state for graph
+    gdpHistory: [],
+    unemploymentHistory: [],
+    wageHistory: [],
+    medianWageHistory: [],
+    happinessHistory: [],
+    healthHistory: [],
+    govProfitHistory: [],
+    govDebtHistory: [],
+    firmCountHistory: [],
+    priceHistory: { food: [], housing: [], services: [] },
+    supplyHistory: { food: [], housing: [], services: [] }
   });
 
   const [config, setConfig] = useState({
@@ -295,17 +397,36 @@ export default function EcoSimUI() {
           unemployment: 99.0,
           gdp: 0,
           govDebt: 0,
+          govProfit: 0,
           happiness: 50,
           housingInv: 0,
           avgWage: 0,
-          gdpHistory: []
+          gdpHistory: [],
+          unemploymentHistory: [],
+          wageHistory: [],
+          medianWageHistory: [],
+          happinessHistory: [],
+          healthHistory: [],
+          govProfitHistory: [],
+          govDebtHistory: [],
+          housingHistory: [],
+          foodHistory: [],
+          servicesHistory: []
         });
         setIsRunning(false);
         setIsInitialized(false);
         setActiveView('CONFIG'); // Go back to config on reset
       } else if (data.metrics) {
         setTick(data.tick);
-        setMetrics(data.metrics);
+        // Merge with existing metrics to preserve defaults if backend is missing keys
+        setMetrics(prev => ({
+          ...prev,
+          ...data.metrics,
+          // Ensure nested objects/arrays are not overwritten with undefined if missing
+          priceHistory: data.metrics.priceHistory || prev.priceHistory || { food: [], housing: [], services: [] },
+          supplyHistory: data.metrics.supplyHistory || prev.supplyHistory || { food: [], housing: [], services: [] },
+          netWorthHistory: data.metrics.netWorthHistory || prev.netWorthHistory || []
+        }));
         if (data.logs && data.logs.length > 0) {
           setLogs(prev => [...prev.slice(-20), ...data.logs]);
         }
@@ -424,22 +545,26 @@ export default function EcoSimUI() {
 
           {/* DASHBOARD VIEW */}
           {activeView === 'DASHBOARD' && (
-            <div className="grid grid-cols-12 gap-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div className="grid grid-cols-12 gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
 
-              {/* KEY METRICS ROW */}
-              <div className="col-span-12 grid grid-cols-4 gap-6 mb-2">
-                <StatTile label="Unemployment" value={`${metrics.unemployment.toFixed(1)}%`} trend={-1.2} />
+              {/* KEY METRICS ROW - COMPACT */}
+              <div className="col-span-12 grid grid-cols-8 gap-4 mb-2">
                 <StatTile label="GDP Output" value={`$${metrics.gdp.toFixed(1)}M`} trend={2.4} />
-                <StatTile label="Govt Debt" value={`$${metrics.govDebt.toFixed(1)}M`} trend={-0.8} />
-                <StatTile label="Social Index" value={metrics.happiness.toFixed(0)} trend={4.1} suffix="/100" />
+                <StatTile label="Net Worth" value={`$${(metrics.netWorth || 0).toFixed(1)}M`} trend={1.5} />
+                <StatTile label="Gov Profit" value={`$${(metrics.govProfit || 0).toFixed(2)}M`} trend={metrics.govProfit > 0 ? 1 : -1} />
+                <StatTile label="Gov Debt" value={`$${metrics.govDebt.toFixed(1)}M`} trend={-0.8} />
+                <StatTile label="Unemployment" value={`${metrics.unemployment.toFixed(1)}%`} trend={-1.2} />
+                <StatTile label="Employment" value={`${(100 - metrics.unemployment).toFixed(1)}%`} trend={1.2} />
+                <StatTile label="Avg Wage" value={`$${metrics.avgWage.toFixed(2)}`} trend={0.5} />
+                <StatTile label="Happiness" value={`${metrics.happiness.toFixed(1)}`} trend={0.1} />
               </div>
 
-              {/* MAIN VISUALIZER */}
-              <div className="col-span-8 tech-panel min-h-[400px] p-6 flex flex-col">
-                <div className="flex justify-between items-center mb-6">
+              {/* MAIN VISUALIZER - MULTI-GRAPH GRID */}
+              <div className="col-span-12 tech-panel min-h-[600px] p-4 flex flex-col">
+                <div className="flex justify-between items-center mb-4">
                   <h3 className="font-display font-bold text-lg text-slate-200 flex items-center">
                     <BarChart3 className="mr-2 text-sky-500" size={20} />
-                    GDP GROWTH (50-TICK INTERVALS)
+                    ECONOMIC MONITOR (50-TICK INTERVALS)
                   </h3>
                   <div className="flex space-x-2">
                     <span className="px-2 py-1 bg-slate-800 text-xs font-mono text-slate-400 border border-slate-700">REALTIME</span>
@@ -447,119 +572,123 @@ export default function EcoSimUI() {
                   </div>
                 </div>
 
-                {/* Dynamic GDP Graph - Line Chart */}
-                <div className="flex-1 relative border-l border-b border-slate-700/50 px-4 pb-0 overflow-hidden">
-                  {metrics.gdpHistory && metrics.gdpHistory.length > 1 ? (
-                    <div className="w-full h-full relative">
-                      {(() => {
-                        const data = metrics.gdpHistory.slice(-50); // Show last 50 points
-                        const values = data.map(p => p.value);
-                        const minVal = Math.min(...values, 0);
-                        const maxVal = Math.max(...values, 0.5);
-                        const range = maxVal - minVal || 1;
+                <div className="flex-1 grid grid-cols-3 gap-4">
+                  {/* 1. GDP GROWTH */}
+                  <LineChart
+                    title="GDP GROWTH"
+                    data={metrics.gdpHistory}
+                    color="#38bdf8" // Sky Blue
+                    minScale={0.5}
+                    suffix="M"
+                    formatValue={v => `$${v.toFixed(2)}`}
+                  />
 
-                        // Generate path points
-                        const points = data.map((point, i) => {
-                          const x = (i / (data.length - 1)) * 100;
-                          const y = 100 - ((point.value - minVal) / range) * 80 - 10;
-                          return `${x},${y}`;
-                        }).join(' ');
+                  {/* 2. WAGE TRENDS (Mean vs Median) */}
+                  <LineChart
+                    title="WAGE TRENDS (MEAN/MEDIAN)"
+                    data={[metrics.wageHistory, metrics.medianWageHistory]}
+                    color={["#10b981", "#fbbf24"]} // Emerald, Amber
+                    minScale={0}
+                    suffix=""
+                    formatValue={v => `$${v.toFixed(2)}`}
+                  />
 
-                        // Zero line Y position
-                        const zeroY = 100 - ((0 - minVal) / range) * 80 - 10;
+                  {/* 3. UNEMPLOYMENT */}
+                  <LineChart
+                    title="UNEMPLOYMENT RATE"
+                    data={metrics.unemploymentHistory}
+                    color="#ef4444" // Red
+                    minScale={0}
+                    suffix="%"
+                    formatValue={v => v.toFixed(1)}
+                  />
 
-                        return (
-                          <svg className="w-full h-full overflow-visible" preserveAspectRatio="none" viewBox="0 0 100 100">
-                            {/* Zero Line */}
-                            <line x1="0" y1={zeroY} x2="100" y2={zeroY} stroke="#475569" strokeWidth="0.5" strokeDasharray="2 2" />
+                  {/* 4. TOTAL NET WORTH (Replaces Gov Debt) */}
+                  <LineChart
+                    title="TOTAL NET WORTH"
+                    data={metrics.netWorthHistory || []}
+                    color="#a855f7" // Purple
+                    minScale={0}
+                    suffix="M"
+                    formatValue={v => `$${v.toFixed(2)}`}
+                  />
 
-                            {/* Line Stroke */}
-                            <polyline points={points} fill="none" stroke="#38bdf8" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+                  {/* 5. HEALTH INDEX */}
+                  <LineChart
+                    title="HEALTH INDEX"
+                    data={metrics.healthHistory}
+                    color="#ec4899" // Pink
+                    minScale={0}
+                    suffix="/100"
+                    formatValue={v => v.toFixed(1)}
+                  />
 
-                            {/* Data Points */}
-                            {data.map((point, i) => {
-                              const x = (i / (data.length - 1)) * 100;
-                              const y = 100 - ((point.value - minVal) / range) * 80 - 10;
+                  {/* 6. MARKET PRICES (Food, Housing, Services) */}
+                  <LineChart
+                    title="MARKET PRICES (F/H/S)"
+                    data={[
+                      metrics.priceHistory?.food || [],
+                      metrics.priceHistory?.housing || [],
+                      metrics.priceHistory?.services || []
+                    ]}
+                    color={["#d97706", "#10b981", "#06b6d4"]} // Amber, Emerald, Cyan
+                    minScale={0}
+                    suffix=""
+                    formatValue={v => `$${v.toFixed(2)}`}
+                  />
 
-                              // Determine color based on trend
-                              let dotColor = "#38bdf8"; // Default Blue (Neutral/First point)
-                              if (i > 0) {
-                                const prev = data[i - 1].value;
-                                if (point.value > prev) dotColor = "#10b981"; // Green (Up)
-                                else if (point.value < prev) dotColor = "#ef4444"; // Red (Down)
-                              }
+                  {/* 7. MARKET SUPPLY (Food, Housing, Services) */}
+                  <LineChart
+                    title="TOTAL SUPPLY (F/H/S)"
+                    data={[
+                      metrics.supplyHistory?.food || [],
+                      metrics.supplyHistory?.housing || [],
+                      metrics.supplyHistory?.services || []
+                    ]}
+                    color={["#d97706", "#10b981", "#06b6d4"]} // Amber, Emerald, Cyan
+                    minScale={0}
+                    suffix=""
+                    formatValue={v => Math.floor(v)}
+                  />
 
-                              return (
-                                <g key={i} className="group">
-                                  <circle cx={x} cy={y} r="1" fill={dotColor} className="transition-all duration-300 hover:r-2 cursor-crosshair" />
-                                  {/* Tooltip */}
-                                  <foreignObject x={x - 20} y={y - 25} width="40" height="20" className="overflow-visible opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                                    <div className="bg-slate-800 text-[10px] text-white px-1 py-0.5 rounded border border-slate-600 whitespace-nowrap text-center">
-                                      ${point.value.toFixed(2)}M
-                                    </div>
-                                  </foreignObject>
-                                </g>
-                              );
-                            })}
-                          </svg>
-                        );
-                      })()}
-                    </div>
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-slate-600 font-mono text-sm">
-                      {metrics.gdpHistory.length === 1 ? "CALCULATING TREND..." : "WAITING FOR DATA..."}
-                    </div>
-                  )}
+                  {/* 8. FISCAL BALANCE (Profit) */}
+                  <LineChart
+                    title="FISCAL BALANCE (PROFIT)"
+                    data={metrics.govProfitHistory}
+                    color="#8b5cf6" // Violet
+                    minScale={-5}
+                    suffix="M"
+                    formatValue={v => `$${v.toFixed(2)}`}
+                  />
+
+                  {/* 9. FIRM COUNT */}
+                  <LineChart
+                    title="ACTIVE FIRMS"
+                    data={metrics.firmCountHistory}
+                    color="#64748b" // Slate
+                    minScale={0}
+                    suffix=""
+                    formatValue={v => Math.floor(v)}
+                  />
                 </div>
               </div>
 
-              {/* SIDE PANEL (STATUS) */}
-              <div className="col-span-4 space-y-6">
-
-                {/* Housing Sector Mini-View */}
-                <div className="tech-panel p-5 tech-corners">
-                  <div className="flex justify-between items-center mb-4">
-                    <h4 className="text-sm font-bold text-slate-300">HOUSING SUPPLY</h4>
-                    <Building2 size={16} className="text-emerald-400" />
-                  </div>
-                  <div className="text-4xl font-mono text-slate-100 mb-2">{Math.floor(metrics.housingInv)} <span className="text-sm text-slate-500">units</span></div>
-                  <div className="progress-bar h-2 bg-slate-800 mt-2">
-                    <div className="progress-fill bg-emerald-500" style={{ width: `${Math.min(100, (metrics.housingInv / 200) * 100)}%` }}></div>
-                  </div>
-                  <div className="mt-2 text-xs text-slate-500 font-mono">Saturation Level: Safe</div>
-                </div>
-
-                {/* Wage/Labor */}
-                <div className="tech-panel p-5 tech-corners">
-                  <div className="flex justify-between items-center mb-4">
-                    <h4 className="text-sm font-bold text-slate-300">LABOR MARKET</h4>
-                    <Users size={16} className="text-amber-400" />
-                  </div>
-                  <div className="flex justify-between items-end">
+              {/* SYSTEM ADVISORY FOOTER */}
+              <div className="col-span-12">
+                <div className="tech-panel p-3 border-l-2 border-amber-500 bg-amber-500/5 flex justify-between items-center">
+                  <div className="flex items-start space-x-2">
+                    <Zap className="text-amber-500 shrink-0 mt-0.5" size={14} />
                     <div>
-                      <div className="text-sm text-slate-500">AVG WAGE</div>
-                      <div className="text-2xl text-slate-200 font-mono">${metrics.avgWage.toFixed(2)}/hr</div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-sm text-slate-500">PARTICIPATION</div>
-                      <div className="text-xl text-sky-400 font-mono">{(100 - metrics.unemployment).toFixed(1)}%</div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* System Alerts */}
-                <div className="tech-panel p-4 border-l-4 border-amber-500 bg-amber-500/5">
-                  <div className="flex items-start space-x-3">
-                    <Zap className="text-amber-500 shrink-0 mt-1" size={18} />
-                    <div>
-                      <h4 className="text-amber-400 font-bold text-sm">OPTIMIZATION REQUIRED</h4>
-                      <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-                        Supply chain friction detected in RAW_MATERIAL sector. Consider increasing infrastructure investment.
+                      <h4 className="text-amber-400 font-bold text-xs">SYSTEM ADVISORY</h4>
+                      <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
+                        Monitor inflation risk. Supply chain nominal.
                       </p>
                     </div>
                   </div>
+                  <div className="flex space-x-4 text-xs font-mono text-slate-500">
+                    <span>FIRMS: <span className="text-slate-300">{metrics.firmCountHistory && metrics.firmCountHistory.length > 0 ? metrics.firmCountHistory[metrics.firmCountHistory.length - 1].value : setupConfig.num_firms * 3}</span></span>
+                  </div>
                 </div>
-
               </div>
             </div>
           )}

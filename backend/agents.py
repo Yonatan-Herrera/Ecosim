@@ -6,9 +6,14 @@ These agents will eventually replace the current recommendation system and activ
 make decisions to drive the simulation forward.
 """
 
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+import numpy as np
+
+from config import CONFIG
 
 
 def _get_good_category(good_name: str, good_categories: Optional[Dict[str, str]] = None) -> str:
@@ -46,6 +51,16 @@ class HouseholdAgent:
     wage: float = 0.0
     ticks: int=1
     owns_housing: bool = False  # Track if household already owns housing
+    renting_from_firm_id: Optional[int] = None  # Firm ID of housing provider (rental)
+    monthly_rent: float = 0.0  # Current rent amount paid per tick
+
+    # H4: Income breakdown tracking (for debugging and anomaly detection)
+    last_wage_income: float = 0.0
+    last_transfer_income: float = 0.0
+    last_dividend_income: float = 0.0
+    last_other_income: float = 0.0
+    last_consumption_spending: float = 0.0
+    last_tick_cash_start: float = 0.0  # Cash at start of tick for change calculation
     # Preferences and heuristics
     consumption_budget_share: float = 0.7  # Legacy field (overridden by savings_rate_target if set)
     good_weights: Dict[str, float] = field(default_factory=dict)  # DEPRECATED: use category_weights
@@ -77,6 +92,8 @@ class HouseholdAgent:
     # Skill development
     skill_growth_rate: float = 0.001  # base skill improvement per tick when employed
     education_cost_per_skill_point: float = 1000.0  # cost to improve skill by 0.1
+    last_skill_update_tick: int = 0  # Tick when skills were last increased (for rate limiting)
+    last_wage_update_tick: int = 0  # Tick when wage premiums were last increased (for rate limiting)
 
     # Wellbeing and performance factors
     happiness: float = 0.7  # 0-1 scale, affects productivity and consumption
@@ -87,7 +104,13 @@ class HouseholdAgent:
     # Wellbeing dynamics
     happiness_decay_rate: float = 0.01  # Happiness naturally decays without maintenance
     morale_decay_rate: float = 0.02  # Morale decays faster than happiness
-    health_decay_rate: float = 0.005  # Health decays slowly over time
+    health_decay_rate: float = 0.0  # Dynamic per-tick health decay (set in __post_init__)
+    health_decay_per_year: float = 0.0  # Annual health decay characteristic (set in __post_init__)
+
+    # Medical loan tracking
+    medical_loan_principal: float = 0.0  # Original medical loan amount
+    medical_loan_remaining: float = 0.0  # Remaining balance with interest
+    medical_loan_payment_per_tick: float = 0.0  # Payment per tick (10% of wage)
 
     # Minimum consumption requirements per tick
     min_food_per_tick: float = 2.0  # Minimum food units needed per tick
@@ -148,6 +171,19 @@ class HouseholdAgent:
         # Initialize saving_tendency as innate thriftiness [0.0, 1.0]
         self.saving_tendency = rng.random()  # Uniform [0.0, 1.0]
 
+        # Initialize health decay characteristic (annual health loss)
+        # Distribution: majority lose 0-20 per year, some 20-30, very few 30-50
+        rand_val = rng.random()
+        if rand_val < 0.70:  # 70% of people: 0-20 health loss per year
+            self.health_decay_per_year = rng.uniform(0.0, 0.20)
+        elif rand_val < 0.95:  # 25% of people: 20-30 health loss per year
+            self.health_decay_per_year = rng.uniform(0.20, 0.30)
+        else:  # 5% of people: 30-50 health loss per year (chronic conditions)
+            self.health_decay_per_year = rng.uniform(0.30, 0.50)
+
+        # Convert annual decay to per-tick decay (52 ticks per year)
+        self.health_decay_rate = self.health_decay_per_year / 52.0
+
         if not self.category_weights:
             base_categories = ["food", "housing", "services"]
             self.category_weights = {cat: 1.0 / len(base_categories) for cat in base_categories}
@@ -206,19 +242,23 @@ class HouseholdAgent:
     def _get_category_price_cap(
         self,
         category: str,
-        options: List[Dict[str, float]]
+        options: List[Dict[str, float]],
+        precomputed_prices: Optional[tuple] = None
     ) -> float:
         """
         Determine the maximum acceptable price for a category this tick.
         """
-        prices = [opt.get("price", 0.0) for opt in options if opt.get("price", 0.0) > 0]
-        if not prices:
-            return 0.0
+        if precomputed_prices:
+            min_price, median_price, max_price = precomputed_prices
+        else:
+            prices = [opt.get("price", 0.0) for opt in options if opt.get("price", 0.0) > 0]
+            if not prices:
+                return 0.0
 
-        prices.sort()
-        min_price = prices[0]
-        max_price = prices[-1]
-        median_price = prices[len(prices) // 2]
+            prices.sort()
+            min_price = prices[0]
+            max_price = prices[-1]
+            median_price = prices[len(prices) // 2]
 
         affordability = self._get_affordability_score()
         wage_basis = self.wage if self.wage > 0 else self.expected_wage
@@ -241,59 +281,125 @@ class HouseholdAgent:
     def _plan_category_purchases(
         self,
         budget: float,
-        firm_market_info: Dict[str, List[Dict[str, float]]]
+        firm_market_info: Dict[str, List[Dict[str, float]]],
+        price_cache: Optional[Dict[str, tuple]] = None,
+        biased_weights_override: Optional[Dict[str, float]] = None,
+        category_fraction_override: Optional[Dict[str, float]] = None,
+        category_option_cache: Optional[Dict[str, List[Dict[str, float]]]] = None
     ) -> Dict[int, float]:
         """
         Plan purchases using budget allocations influenced by preferences/traits.
         """
         planned: Dict[int, float] = {}
 
-        biased = {
-            "food": self.category_weights.get("food", 0.0) * self.food_preference,
-            "housing": self.category_weights.get("housing", 0.0) * self.housing_preference,
-            "services": self.category_weights.get("services", 0.0) * self.services_preference,
-        }
-        total_bias = sum(biased.values())
-        if total_bias <= 0:
-            return planned
+        if category_fraction_override is not None:
+            fractions = {k: v for k, v in category_fraction_override.items() if v > 0}
+        elif biased_weights_override is not None:
+            biased = dict(biased_weights_override)
+            total_bias = sum(biased.values())
+            if total_bias <= 0:
+                return planned
+            fractions = {cat: weight / total_bias for cat, weight in biased.items() if weight > 0}
+        else:
+            biased = {
+                "food": self.category_weights.get("food", 0.0) * self.food_preference,
+                "housing": self.category_weights.get("housing", 0.0) * self.housing_preference,
+                "services": self.category_weights.get("services", 0.0) * self.services_preference,
+            }
+            total_bias = sum(biased.values())
+            if total_bias <= 0:
+                return planned
+            fractions = {cat: weight / total_bias for cat, weight in biased.items() if weight > 0}
 
-        for category, bias_weight in biased.items():
-            if bias_weight <= 0:
+        housing_share = fractions.pop("housing", 0.0)
+        housing_budget_cap = max(0.0, budget * housing_share)
+        remaining_budget = budget
+        housing_qty_remaining = 1.0
+
+        if housing_budget_cap > 0 and remaining_budget > 0:
+            options = category_option_cache.get("housing") if category_option_cache else firm_market_info.get("housing", [])
+            if options:
+                precomputed = price_cache.get("housing") if price_cache else None
+                price_cap = self._get_category_price_cap("housing", options, precomputed_prices=precomputed)
+                if price_cap > 0:
+                    style = self.purchase_styles.get("housing", self.default_purchase_style)
+                    chosen = self._choose_firm_based_on_style(options, style)
+                    if chosen and chosen.get("price", 0.0) > 0:
+                        price = chosen["price"]
+                        allowed_budget = min(remaining_budget, housing_budget_cap)
+                        qty = min(housing_qty_remaining, allowed_budget / price)
+                        if qty > 0:
+                            cost = qty * price
+                            remaining_budget = max(0.0, remaining_budget - cost)
+                            housing_qty_remaining -= qty
+                            firm_id = chosen["firm_id"]
+                            planned[firm_id] = planned.get(firm_id, 0.0) + qty
+
+        total_other_share = sum(fractions.values())
+        weights_remaining = total_other_share
+
+        for category, share in fractions.items():
+            if share <= 0 or remaining_budget <= 0 or weights_remaining <= 0:
                 continue
-            options = firm_market_info.get(category, [])
+            options = category_option_cache.get(category) if category_option_cache else firm_market_info.get(category, [])
             if not options:
                 continue
 
-            price_cap = self._get_category_price_cap(category, options)
+            precomputed = price_cache.get(category) if price_cache else None
+            price_cap = self._get_category_price_cap(category, options, precomputed_prices=precomputed)
             if price_cap <= 0:
                 continue
 
-            affordable_options = [
-                option for option in options
-                if 0 < option.get("price", 0.0) <= price_cap
-            ]
-            if not affordable_options:
+            affordable_options: List[Dict[str, float]] = options
+            category_budget = remaining_budget * (share / weights_remaining)
+            weights_remaining -= share
+            if category_budget <= 0:
                 continue
 
-            style = self.purchase_styles.get(category, self.default_purchase_style)
-            chosen = self._choose_firm_based_on_style(affordable_options, style)
-            if chosen is None or chosen.get("price", 0.0) <= 0:
+            firm_ids = np.array([opt["firm_id"] for opt in affordable_options], dtype=np.int32)
+            prices = np.array([opt["price"] for opt in affordable_options], dtype=np.float64)
+            qualities = np.array([opt["quality"] for opt in affordable_options], dtype=np.float64)
+            valid_mask = prices > 0
+            firm_ids = firm_ids[valid_mask]
+            prices = prices[valid_mask]
+            qualities = qualities[valid_mask]
+            if firm_ids.size == 0:
                 continue
 
-            category_budget = budget * (bias_weight / total_bias)
-            quantity = category_budget / chosen["price"]
-
-            if quantity <= 0:
+            # Utilities and softmax weights
+            utilities = (
+                self.quality_lavishness * qualities -
+                self.price_sensitivity * (prices / max(price_cap, 1e-6))
+            )
+            rng = random.Random(hash((self.household_id, category)))
+            utilities += np.array([rng.uniform(-0.25, 0.25) for _ in range(len(utilities))])
+            max_u = utilities.max()
+            weights = np.exp(utilities - max_u)
+            weight_sum = weights.sum()
+            if weight_sum <= 0:
                 continue
-
-            cap_ratio = chosen["price"] / price_cap
-            if cap_ratio > 0.85:
-                sensitivity = max(0.2, min(1.5, self.price_sensitivity))
-                scale = 1.0 - sensitivity * (cap_ratio - 0.85) * 3.0
-                quantity *= max(0.15, scale)
-
-            firm_id = chosen["firm_id"]
-            planned[firm_id] = planned.get(firm_id, 0.0) + quantity
+            shares = weights / weight_sum
+            firm_budgets = category_budget * shares
+            quantities = firm_budgets / prices
+            cap_ratio = prices / price_cap
+            sensitivity = max(0.2, min(1.5, self.price_sensitivity))
+            adjustments = np.where(
+                cap_ratio > 0.85,
+                np.maximum(0.15, 1.0 - sensitivity * (cap_ratio - 0.85) * 3.0),
+                1.0
+            )
+            quantities *= adjustments
+            spent = 0.0
+            for fid, qty, price, adj in zip(firm_ids, quantities, prices, adjustments):
+                if qty <= 0:
+                    continue
+                actual_qty = max(0.0, qty)
+                cost = actual_qty * price
+                if cost <= 0:
+                    continue
+                planned[fid] = planned.get(fid, 0.0) + actual_qty
+                spent += cost
+            remaining_budget = max(0.0, remaining_budget - min(spent, remaining_budget))
 
         return planned
 
@@ -346,6 +452,11 @@ class HouseholdAgent:
     def is_employed(self) -> bool:
         """Check if household is currently employed."""
         return self.employer_id is not None
+
+    @property
+    def can_work(self) -> bool:
+        """Households can work regardless of health (health affects productivity, not eligibility)."""
+        return True
 
     def to_dict(self) -> Dict[str, object]:
         """
@@ -403,50 +514,45 @@ class HouseholdAgent:
             if hasattr(self, key):
                 setattr(self, key, value)
 
-    def plan_labor_supply(self, unemployment_benefit: float) -> Dict[str, object]:
+    def plan_labor_supply(self, unemployment_benefit: float = 0.0) -> Dict[str, object]:
         """
         Decide whether to search for job and what wage to require.
+
+        H1': Uses the household's reservation_wage field which decays over unemployment duration.
+        The reservation wage is set by the economy's _sync_household_expectations method.
 
         Does not mutate state; returns a plan dict.
 
         Args:
-            unemployment_benefit: Government support for unemployed
+            unemployment_benefit: Government support (unused - kept for API compatibility)
 
         Returns:
             Dict with household_id, searching_for_job, reservation_wage, skills_level
         """
-        market_value = self.skills_level * 20.0
+        # Note: unemployment_benefit parameter kept for backward compatibility but not used
+        # Reservation wage is now managed by the economy's _sync_household_expectations
+        # Use the household's reservation wage (set by economy based on employment status)
+        # This reservation wage decays from 1.2× benefits (day 1) to 1.05× benefits (long-term)
+        reservation_wage_for_tick = self.reservation_wage
 
-        # Baseline reservation from government support
-        baseline_reservation = unemployment_benefit * self.reservation_markup_over_benefit
+        # Desperation adjustment: very low cash makes households accept lower wages
+        if self.cash_balance < 200:
+            desperation_factor = 0.85  # Accept 15% less when desperate
+            reservation_wage_for_tick *= desperation_factor
 
-        # Minimum living cost: housing + food
+        # Ensure minimum to survive (living cost floor)
         housing_price = self.price_beliefs.get("housing", self.default_price_level)
         food_price = self.price_beliefs.get("food", self.default_price_level)
-        living_cost = housing_price + self.min_food_per_tick * food_price
+        living_cost = 0.3 * housing_price + self.min_food_per_tick * food_price
+        living_cost = max(living_cost, 25.0)
+        reservation_wage_for_tick = max(reservation_wage_for_tick, living_cost)
 
-        # Adjust based on cash position
-        if self.cash_balance < self.min_cash_for_aggressive_job_search:
-            # Desperate: willing to accept less
-            adjustment_factor = 0.85  # deterministic downward adjustment
-            reservation_wage_for_tick = baseline_reservation * adjustment_factor
-        else:
-            # Comfortable: can be pickier, nudge toward expected wage
-            reservation_wage_for_tick = 0.7 * baseline_reservation + 0.3 * self.expected_wage
-
-        if self.cash_balance < 200:
-            desperation = 0.6
-            reservation_wage_for_tick = min(self.expected_wage, market_value) * desperation
-            reservation_wage_for_tick = max(reservation_wage_for_tick, 1.0)
-
-        # Ensure ability to cover living costs when cash is low
+        # Search if unemployed or desperate (very low cash)
         if self.cash_balance < living_cost:
-            reservation_wage_for_tick = max(reservation_wage_for_tick, living_cost)
             searching_for_job = True
         else:
             searching_for_job = not self.is_employed
 
-        # Decide if searching
         return {
             "household_id": self.household_id,
             "searching_for_job": searching_for_job,
@@ -508,9 +614,9 @@ class HouseholdAgent:
         """
         Decide desired budget allocation across categories.
 
-        NEW APPROACH: Budget is based on income minus savings, not cash balance.
-        - Employed households save 0-15% of wage (based on saving_tendency and wealth)
-        - Unemployed households dissave (spend transfers + draw down cash reserves)
+        NEW APPROACH: Budget scales with total liquid wealth (cash + this tick's wage).
+        - Fraction of wealth spent grows with confidence and wealth
+        - High-income households (CEOs) now deploy far more capital each tick
 
         Does not mutate state; returns a plan dict with category budgets.
         Market clearing will handle firm selection within categories.
@@ -523,31 +629,40 @@ class HouseholdAgent:
         Returns:
             Dict with household_id, category_budgets, and legacy planned_purchases
         """
-        # Calculate income for this tick (wage if employed, or transfers if unemployed)
-        # Note: Transfers are already added to cash_balance in earlier phase
-        # So we treat wage as "new income" and existing cash as "savings"
+        config = CONFIG.households
+        confidence = 1.0 / (1.0 + max(unemployment_rate, 0.0))
+
+        # Spendable base includes cash on hand plus this tick's wage if employed.
+        # This ensures CEOs/owners with large balances deploy more capital each tick.
+        resource_base = max(0.0, self.cash_balance)
+        if self.is_employed:
+            resource_base += max(0.0, self.wage)
+
+        if resource_base <= 0.0:
+            return {
+                "household_id": self.household_id,
+                "category_budgets": {},
+                "planned_purchases": {},
+            }
+
+        wealth_ratio = min(1.0, resource_base / max(1.0, config.high_wealth_reference))
+        spend_fraction = config.min_spend_fraction + (config.confidence_multiplier * confidence)
 
         if self.is_employed:
-            # Employed: Save a fraction of wage, spend the rest
-            income = self.wage
             saving_rate = self.compute_saving_rate()
-            amount_saved = saving_rate * income
-            amount_for_consumption = max(0.0, income - amount_saved)
-
-            # Can also dip into cash reserves if needed (up to 20% of balance)
-            # This allows consumption smoothing
-            max_cash_drawdown = self.cash_balance * 0.2
-            budget = amount_for_consumption + max_cash_drawdown
+            spend_fraction += 0.1  # Stability bonus for steady income
+            spend_fraction *= max(0.5, 1.0 - saving_rate)
         else:
-            # Unemployed: No wage income, must draw down cash reserves
-            # Spend more aggressively to maintain consumption (dissaving)
-            # Use unemployment rate to modulate spending anxiety
-            confidence = 1.0 / (1.0 + max(unemployment_rate, 0.0))
+            spend_fraction -= 0.05  # Unemployed households stay cautious
 
-            # Unemployed households spend 50-80% of cash balance per tick
-            # Higher unemployment → more fear → less spending
-            spend_fraction = 0.5 + (0.3 * confidence)
-            budget = self.cash_balance * spend_fraction
+        spend_fraction += 0.3 * wealth_ratio  # Wealthy households spend a larger share
+        panic_factor = min(1.0, unemployment_rate * config.unemployment_spend_sensitivity)
+        spend_fraction *= max(0.2, 1.0 - panic_factor)
+        spend_fraction = max(config.min_spend_fraction, min(config.max_spend_fraction, spend_fraction))
+
+        budget = resource_base * spend_fraction
+        subsistence_floor = min(resource_base, config.subsistence_min_cash)
+        budget = max(budget, subsistence_floor)
 
         if budget <= 0:
             return {
@@ -600,30 +715,58 @@ class HouseholdAgent:
 
             # Plan purchases for each good
             planned_purchases = {}
+            housing_infos = []
+            other_infos = []
             for good, weight in normalized_weights.items():
                 if weight <= 0:
                     continue
-
-                # Determine expected price
                 if good in local_beliefs:
                     expected_price = local_beliefs[good]
                 elif good in market_prices:
                     expected_price = market_prices[good]
                 else:
                     expected_price = self.default_price_level
-
                 if expected_price <= 0:
                     continue
-
-                # Allocate budget to this good
-                good_budget = budget * weight
-                if is_housing_good(good):
-                    planned_quantity = min(1.0, good_budget / expected_price)
+                category = _get_good_category(good, good_category_lookup)
+                if category == "housing":
+                    housing_infos.append((good, weight, expected_price))
                 else:
-                    planned_quantity = good_budget / expected_price
+                    other_infos.append((good, weight, expected_price))
 
-                if planned_quantity > 0:
-                    planned_purchases[good] = planned_quantity
+            remaining_budget = budget
+            housing_needed = 1.0
+            housing_infos.sort(key=lambda item: item[2])
+            for good, weight, expected_price in housing_infos:
+                if remaining_budget <= 0 or housing_needed <= 0:
+                    break
+                target_budget = budget * weight if weight > 0 else remaining_budget
+                allowed_budget = min(remaining_budget, target_budget)
+                if allowed_budget <= 0:
+                    continue
+                qty = min(housing_needed, allowed_budget / expected_price)
+                if qty <= 0:
+                    continue
+                cost = qty * expected_price
+                planned_purchases[good] = planned_purchases.get(good, 0.0) + qty
+                remaining_budget = max(0.0, remaining_budget - cost)
+                housing_needed -= qty
+
+            weights_remaining = sum(weight for _, weight, _ in other_infos if weight > 0)
+            for good, weight, expected_price in other_infos:
+                if remaining_budget <= 0 or weight <= 0 or weights_remaining <= 0:
+                    break
+                share = weight / weights_remaining
+                weights_remaining -= weight
+                good_budget = remaining_budget * share
+                if good_budget <= 0:
+                    continue
+                qty = good_budget / expected_price
+                if qty <= 0:
+                    continue
+                cost = qty * expected_price
+                planned_purchases[good] = planned_purchases.get(good, 0.0) + qty
+                remaining_budget = max(0.0, remaining_budget - cost)
 
             return {
                 "household_id": self.household_id,
@@ -631,10 +774,136 @@ class HouseholdAgent:
                 "planned_purchases": planned_purchases,
             }
 
+    def should_spend_on_healthcare(self) -> tuple[bool, float, bool]:
+        """
+        Determine if household should spend on healthcare and how much.
+
+        Returns:
+            (should_spend, amount, needs_loan): Whether to spend, budget, and if loan needed
+
+        Healthcare spending logic:
+        - Health < 70%: Should prioritize healthcare
+        - Probability of spending increases as health decreases
+        - Health < 20%: Always seek care and borrow if needed
+        - Cost scales with health recovery needed (exponential)
+        - If cost > cash: take medical loan for the shortfall
+        """
+        import random
+
+        if self.health >= 0.70:
+            return False, 0.0, False
+
+        # Probability of seeking healthcare (higher when health is lower)
+        # At 70%: ~10% chance, At 40%: ~60% chance, At 20%: ~90% chance
+        health_urgency = max(0.0, 0.70 - self.health)  # 0.0 to 0.70
+        base_probability = min(0.95, health_urgency / 0.70 * 0.9)  # Scale to 0-90%
+
+        critical = self.health < 0.40
+        if critical:
+            base_probability = max(base_probability, 0.80)
+
+        if self.health < 0.20:
+            base_probability = 1.0
+
+        if random.random() > base_probability:
+            return False, 0.0, False
+
+        # Calculate cost of healthcare (exponential scaling)
+        # Recovery amount: bring health up to 70% (or current +0.30, whichever is less)
+        desired_recovery = min(0.30, max(0.0, 0.70 - self.health))
+
+        # Cost formula: Exponential scaling - recovering more health is much more expensive
+        # 10% recovery ≈ 50-100 cash, 30% recovery ≈ 500-1000 cash, 50% recovery ≈ 2000-4000 cash
+        base_cost_per_percent = 200.0  # Base cost for 1% health recovery
+        exponential_factor = 1.5  # Exponential growth factor
+        total_cost = base_cost_per_percent * (desired_recovery * 100) * (1.0 + desired_recovery * exponential_factor)
+
+        # Check if we need a medical loan
+        emergency_reserve = self.cash_balance * 0.10
+        max_affordable = max(0.0, self.cash_balance - emergency_reserve)
+
+        if total_cost > max_affordable:
+            # Need a medical loan for the shortfall
+            if self.health < 0.20:
+                needs_loan = True
+                actual_budget = total_cost
+            else:
+                needs_loan = True
+                actual_budget = total_cost
+        else:
+            # Can afford it without loan
+            needs_loan = False
+            actual_budget = total_cost
+
+        # Only proceed if we can afford at least some minimum
+        if actual_budget < 20.0:
+            return False, 0.0, False
+
+        return True, actual_budget, needs_loan
+
+    def take_medical_loan(self, loan_amount: float) -> None:
+        """
+        Take out a medical loan to cover healthcare costs.
+
+        Loan terms:
+        - Interest rate: 1-3% annually (random, scaled by 52 ticks/year)
+        - Repayment: 10% of wage per tick
+        - Only available to employed households
+
+        Args:
+            loan_amount: Amount to borrow for medical expenses
+        """
+        import random
+
+        # Random interest rate between 1-3% annually
+        annual_interest_rate = random.uniform(0.01, 0.03)
+
+        # Calculate total repayment with interest (simple interest)
+        # Total = principal × (1 + annual_rate)
+        total_repayment = loan_amount * (1.0 + annual_interest_rate)
+
+        # Set loan terms
+        self.medical_loan_principal = loan_amount
+        self.medical_loan_remaining = total_repayment
+        self.medical_loan_payment_per_tick = 0.0
+
+        # Grant the loan (add to cash balance)
+        self.cash_balance += loan_amount
+
+    def make_medical_loan_payment(self) -> float:
+        """
+        Make a medical loan payment based on minimum wage.
+
+        Returns:
+            Amount paid toward loan this tick
+
+        Mutates state by deducting payment from cash and reducing loan balance.
+        """
+        if self.medical_loan_remaining <= 0:
+            return 0.0
+
+        from config import CONFIG
+        min_wage = CONFIG.government.default_unemployment_benefit * CONFIG.government.wage_floor_multiplier
+        base_payment = 0.10 * min_wage
+        payment_amount = min(base_payment, self.medical_loan_remaining, self.cash_balance)
+
+        if payment_amount <= 0:
+            return 0.0
+
+        self.cash_balance -= payment_amount
+        self.medical_loan_remaining -= payment_amount
+
+        if self.medical_loan_remaining <= 0:
+            self.medical_loan_payment_per_tick = 0.0
+            self.medical_loan_principal = 0.0
+
+        return payment_amount
+
     def apply_labor_outcome(
         self,
         outcome: Dict[str, object],
-        market_wage_anchor: Optional[float] = None
+        market_wage_anchor: Optional[float] = None,
+        current_tick: int = 0
     ) -> None:
         """
         Update employment status and wage beliefs based on labor market outcome.
@@ -644,6 +913,7 @@ class HouseholdAgent:
         Args:
             outcome: Dict with employer_id (int | None), wage (float), and employer_category (str | None)
             market_wage_anchor: Optional market-paid wage to nudge expectations toward
+            current_tick: Current simulation tick (for rate-limiting skill/wage growth)
         """
         self.employer_id = outcome["employer_id"]
         self.wage = outcome["wage"]
@@ -658,8 +928,13 @@ class HouseholdAgent:
                 self.category_experience[employer_category] += 1
 
             # Passive skill growth through work experience (diminishing returns)
-            skill_improvement = self.skill_growth_rate * (1.0 - self.skills_level)
-            self.skills_level = min(1.0, self.skills_level + skill_improvement)
+            # Only update skills once every 52 ticks (yearly)
+            if current_tick - self.last_skill_update_tick >= 52:
+                skill_improvement = self.skill_growth_rate * (1.0 - self.skills_level)
+                # Apply 52 ticks worth of growth at once
+                total_improvement = skill_improvement * 52
+                self.skills_level = min(1.0, self.skills_level + total_improvement)
+                self.last_skill_update_tick = current_tick
 
         # Update wage expectations
         if self.is_employed and self.wage > 0:
@@ -671,15 +946,17 @@ class HouseholdAgent:
         else:
             self.unemployment_duration += 1
             # Unemployed: gently nudge expected wage downward
-            duration_pressure = min(0.35, self.unemployment_duration * 0.01)
+            duration_pressure = min(0.45, self.unemployment_duration * 0.02)
             happiness_gap = max(0.0, 0.7 - self.happiness)
             happiness_pressure = min(0.3, happiness_gap * 0.5)
-            base_decay = 0.97  # slightly faster baseline decay
+            base_decay = 0.95
             decay_factor = max(
                 0.5,
                 base_decay - duration_pressure - happiness_pressure
             )
-            decayed_expectation = max(self.expected_wage * decay_factor, 10.0)
+            decayed_expectation = max(self.expected_wage * decay_factor, 5.0)
+            if self.unemployment_duration > 52:
+                decayed_expectation = min(decayed_expectation, self.expected_wage * 0.85)
 
             if market_wage_anchor is not None:
                 anchor_weight = 0.4  # stronger pull toward market when unemployed
@@ -994,8 +1271,8 @@ class FirmAgent:
 
     # Quality and R&D
     rd_spending_rate: float = 0.05  # fraction of revenue spent on R&D each tick
-    quality_improvement_per_rd_dollar: float = 0.01  # quality points per $ of R&D
-    quality_decay_rate: float = 0.02  # quality degradation per tick without maintenance
+    quality_improvement_per_rd_dollar: float = 0.0002  # quality points per $ of R&D (slowed 50x)
+    quality_decay_rate: float = 0.0  # quality decay removed
     accumulated_rd_investment: float = 0.0  # total R&D spending lifetime
 
     # Config / tuning
@@ -1021,6 +1298,29 @@ class FirmAgent:
     last_tick_total_costs: float = 0.0  # Track costs for dividend calculation
     payout_ratio: float = 0.0  # Fraction of net profit paid as dividends
     net_profit: float = 0.0  # Track last tick net profit
+
+    # Loan tracking (for government startup loans)
+    government_loan_principal: float = 0.0  # Original loan amount
+    government_loan_remaining: float = 0.0  # Remaining balance
+    loan_payment_per_tick: float = 0.0  # Weekly payment amount
+    loan_support_ticks: int = 0  # Ticks remaining to meet hiring commitment
+    loan_required_headcount: int = 0  # Target headcount promised when accepting aid
+    ceo_household_id: Optional[int] = None  # CEO owner (gets high salary)
+
+    # Housing-specific properties (only for housing firms)
+    max_rental_units: int = 0  # Maximum number of tenants (0-50 for housing firms)
+    current_tenants: List[int] = field(default_factory=list)  # household_ids renting
+    property_tax_rate: float = 0.0  # Annual property tax rate based on units
+    age_in_ticks: int = 0
+    burn_mode: bool = False
+    high_inventory_streak: int = 0
+    low_inventory_streak: int = 0
+    last_units_sold: float = 0.0
+    last_units_produced: float = 0.0  # Track production for pricing decisions
+    last_revenue: float = 0.0
+    last_profit: float = 0.0
+    burn_mode_active: bool = False  # Track whether firm is in inventory burn mode
+    zero_cash_streak: int = 0  # Consecutive ticks with zero or negative cash
 
     def __post_init__(self):
         """Validate invariants after initialization."""
@@ -1054,8 +1354,6 @@ class FirmAgent:
             )
         if self.rd_spending_rate < 0:
             raise ValueError(f"rd_spending_rate cannot be negative, got {self.rd_spending_rate}")
-        if self.quality_decay_rate < 0:
-            raise ValueError(f"quality_decay_rate cannot be negative, got {self.quality_decay_rate}")
         if self.payout_ratio <= 0:
             rng = random.Random(self.firm_id)
             self.payout_ratio = rng.uniform(0.0, 0.5)
@@ -1075,7 +1373,7 @@ class FirmAgent:
             "cash_balance": self.cash_balance,
             "inventory_units": self.inventory_units,
             "employees": list(self.employees),
-            "employers":list(self.employers),
+            "owners": list(self.owners),
             "expected_sales_units": self.expected_sales_units,
             "production_capacity_units": self.production_capacity_units,
             "productivity_per_worker": self.productivity_per_worker,
@@ -1086,26 +1384,30 @@ class FirmAgent:
             "planned_layoffs_ids": list(self.planned_layoffs_ids),
             "last_tick_planned_hires": self.last_tick_planned_hires,
             "last_tick_actual_hires": self.last_tick_actual_hires,
+            "price": self.price,
             "unit_cost": self.unit_cost,
             "markup": self.markup,
-            "price": self.price,
-            "rd_spending_rate": self.rd_spending_rate,
-            "quality_improvement_per_rd_dollar": self.quality_improvement_per_rd_dollar,
-            "quality_decay_rate": self.quality_decay_rate,
-            "accumulated_rd_investment": self.accumulated_rd_investment,
-            "sales_expectation_alpha": self.sales_expectation_alpha,
-            "price_adjustment_rate": self.price_adjustment_rate,
-            "wage_adjustment_rate": self.wage_adjustment_rate,
-            "target_inventory_multiplier": self.target_inventory_multiplier,
             "min_price": self.min_price,
             "max_hires_per_tick": self.max_hires_per_tick,
             "max_fires_per_tick": self.max_fires_per_tick,
             "is_baseline": self.is_baseline,
             "baseline_production_quota": self.baseline_production_quota,
+            "personality": self.personality,
+            "investment_propensity": self.investment_propensity,
+            "risk_tolerance": self.risk_tolerance,
             "target_inventory_weeks": self.target_inventory_weeks,
             "price_pressure": self.price_pressure,
             "payout_ratio": self.payout_ratio,
             "net_profit": self.net_profit,
+            "last_revenue": self.last_revenue,
+            "last_profit": self.last_profit,
+            "last_units_sold": self.last_units_sold,
+            "government_loan_remaining": self.government_loan_remaining,
+            "loan_payment_per_tick": self.loan_payment_per_tick,
+            "age_in_ticks": self.age_in_ticks,
+            "burn_mode": self.burn_mode,
+            "high_inventory_streak": self.high_inventory_streak,
+            "low_inventory_streak": self.low_inventory_streak,
         }
 
     def apply_overrides(self, overrides: Dict[str, object]) -> None:
@@ -1167,12 +1469,75 @@ class FirmAgent:
             self.max_fires_per_tick = 2
             self.units_per_worker = 20.0
 
+    # --- Capacity / productivity helpers ---
+    def _firm_config(self):
+        return CONFIG.firms
+
+    def _capacity_for_workers(self, worker_count: float) -> float:
+        """Diminishing-returns capacity frontier for a given workforce."""
+        config = self._firm_config()
+        if worker_count <= 0:
+            return 0.0
+        units = max(self.units_per_worker, config.min_base_productivity)
+        alpha = max(0.1, min(0.99, config.diminishing_returns_exponent))
+        return units * (worker_count ** alpha)
+
+    def _productivity_per_worker(self, worker_count: float) -> float:
+        """Average worker productivity implied by the frontier."""
+        if worker_count <= 0:
+            return 0.0
+        return self._capacity_for_workers(worker_count) / worker_count
+
+    def _workers_for_sales(self, target_output: float) -> int:
+        """Inverse of the capacity function to meet desired output."""
+        config = self._firm_config()
+        if target_output <= 0:
+            return config.min_target_workers
+        units = max(self.units_per_worker, config.min_base_productivity)
+        alpha = max(0.1, min(0.99, config.diminishing_returns_exponent))
+        required = (target_output / max(units, 1e-6)) ** (1.0 / alpha)
+        return max(config.min_target_workers, math.ceil(required))
+
+    def _expected_skill_premium(self) -> float:
+        """Baseline expectation for skill + experience wage premia."""
+        return self._firm_config().expected_skill_premium
+
+    def _profit_optimal_workers(
+        self,
+        current_workers: int,
+        expected_sales: float,
+        effective_wage_cost: float
+    ) -> int:
+        """Search a small neighborhood for the most profitable staffing level."""
+        config = self._firm_config()
+        candidate_workers = set()
+        for delta in range(-2, 3):
+            candidate_workers.add(max(config.min_target_workers, current_workers + delta))
+        candidate_workers.add(self._workers_for_sales(expected_sales))
+
+        best_workers = max(config.min_target_workers, current_workers)
+        best_profit = -float("inf")
+        fixed_cost = getattr(self, "fixed_cost", 0.0)
+        for workers in sorted(candidate_workers):
+            capacity = self._capacity_for_workers(workers)
+            expected_output = min(capacity, expected_sales)
+            expected_revenue = expected_output * max(self.price, 0.0)
+            expected_wage_bill = workers * effective_wage_cost
+            expected_profit = expected_revenue - expected_wage_bill - fixed_cost
+            if expected_profit > best_profit:
+                best_profit = expected_profit
+                best_workers = workers
+        return best_workers
+
     def plan_production_and_labor(
         self,
         last_tick_sales_units: float,
         in_warmup: bool = False,
         total_households: int = 0,
-        global_unsold_inventory: float = 0.0
+        global_unsold_inventory: float = 0.0,
+        private_housing_inventory: float = 0.0,
+        large_market: bool = False,
+        post_warmup_cooldown: bool = False
     ) -> Dict[str, object]:
         """
         Decide how much to produce and how many workers are needed.
@@ -1197,107 +1562,201 @@ class FirmAgent:
         Returns:
             Dict with firm_id, planned_production_units, planned_hires_count, planned_layoffs_ids
         """
-        # Update expected sales (local computation, don't mutate yet)
-        updated_expected_sales = (
+        firm_config = self._firm_config()
+        self.age_in_ticks += 1
+        self.last_units_sold = last_tick_sales_units
+
+        smoothed_sales = (
             self.sales_expectation_alpha * last_tick_sales_units +
             (1.0 - self.sales_expectation_alpha) * self.expected_sales_units
         )
+        self.expected_sales_units = max(firm_config.min_expected_sales, smoothed_sales)
 
-        import math
+        if (
+            last_tick_sales_units < firm_config.min_expected_sales
+            and self.inventory_units < firm_config.inventory_exit_epsilon
+        ):
+            self.expected_sales_units = max(
+                firm_config.min_expected_sales,
+                self.expected_sales_units * 0.9
+            )
 
         is_housing_producer = self.good_category.lower() == "housing"
-        # HOUSING MARKET FIX: Stop production if inventory exceeds 110% of households
-        # This prevents the housing glut (was 1.7M units for 10k households)
-        housing_market_saturated = (
-            is_housing_producer
-            and total_households > 0
-            and global_unsold_inventory > (total_households * 1.10)
+        if is_housing_producer:
+            self.expected_sales_units = max(
+                firm_config.min_expected_sales,
+                float(max(1, self.max_rental_units))
+            )
+            planned_layoffs = list(self.employees) if self.employees else []
+            return {
+                "firm_id": self.firm_id,
+                "planned_production_units": 0.0,
+                "planned_hires_count": 0,
+                "planned_layoffs_ids": planned_layoffs,
+                "updated_expected_sales": self.expected_sales_units,
+            }
+
+        housing_market_saturated = False
+        if total_households > 0:
+            if private_housing_inventory > total_households * firm_config.housing_private_saturation_multiplier:
+                firm_high_inventory = self.inventory_units > 2.0 * max(1.0, self.expected_sales_units)
+                if firm_high_inventory:
+                    housing_market_saturated = True
+
+        expected_baseline = max(firm_config.min_expected_sales, self.expected_sales_units)
+        demand_workers = max(
+            firm_config.min_target_workers,
+            self._workers_for_sales(min(expected_baseline, self.production_capacity_units))
         )
 
-        base_productivity = max(self.units_per_worker, 1.0)
+        if large_market:
+            high_inventory_factor = firm_config.high_inventory_factor_large * firm_config.large_market_inventory_relief
+            trigger_streak_threshold = (
+                firm_config.burn_mode_trigger_streak_large +
+                firm_config.large_market_burn_mode_buffer
+            )
+        else:
+            high_inventory_factor = firm_config.high_inventory_factor_small
+            trigger_streak_threshold = firm_config.burn_mode_trigger_streak_small
 
-        def capacity_for_workers(worker_count: int) -> float:
-            if worker_count <= 0:
-                return 0.0
-            return base_productivity * (worker_count ** 0.9)
+        high_inventory = self.inventory_units > high_inventory_factor * expected_baseline
+        low_sellthrough = self.last_units_sold < 0.5 * expected_baseline
 
-        def workers_needed_for_output(target_output: float) -> int:
-            if target_output <= 0:
-                return 0
-            required = (target_output / base_productivity) ** (1.0 / 0.9)
-            return max(1, math.ceil(required))
+        if high_inventory and low_sellthrough:
+            self.high_inventory_streak += 1
+            self.low_inventory_streak = 0
+        else:
+            relief = max(1, firm_config.burn_mode_relief_rate)
+            self.high_inventory_streak = max(0, self.high_inventory_streak - relief)
+            if self.last_units_sold >= 0.8 * expected_baseline:
+                self.low_inventory_streak += 1
+            else:
+                self.low_inventory_streak = max(0, self.low_inventory_streak - relief)
+
+        if (
+            not self.burn_mode
+            and self.age_in_ticks >= firm_config.burn_mode_grace_period
+            and self.high_inventory_streak >= trigger_streak_threshold
+        ):
+            self.burn_mode = True
+
+        if self.burn_mode and (
+            self.low_inventory_streak >= firm_config.burn_mode_exit_streak
+            or self.inventory_units < firm_config.inventory_exit_epsilon
+        ):
+            self.burn_mode = False
+            self.high_inventory_streak = 0
+            self.low_inventory_streak = 0
 
         current_workers = len(self.employees)
         planned_hires = 0
         planned_layoffs: List[int] = []
+        expected_skill_premium = self._expected_skill_premium()
+        effective_wage_cost = self.wage_offer * (1.0 + expected_skill_premium)
+        minimum_private_staff = max(10, firm_config.min_target_workers) if not self.is_baseline else firm_config.min_target_workers
+        skeleton_min = max(firm_config.min_skeleton_workers, firm_config.min_target_workers)
+        if self.loan_required_headcount > 0:
+            minimum_private_staff = max(minimum_private_staff, self.loan_required_headcount)
+            skeleton_min = max(skeleton_min, min(self.loan_required_headcount, minimum_private_staff))
 
-        # DYNAMIC SCALING: Allow firms to change workforce by 10% per tick, or at least 5 people
         scaling_limit = max(5, int(current_workers * 0.10))
+        self.burn_mode_active = self.burn_mode
 
-        if housing_market_saturated:
-            planned_production_units = 0.0
-        elif self.is_baseline and in_warmup:
-            planned_hires = 1_000_000_000  # effectively infinite during warm-up
-            revenue_per_worker = self.price * self.productivity_per_worker
-            self.wage_offer = revenue_per_worker * 0.95
-            planned_production_units = min(self.production_capacity_units, max(self.baseline_production_quota, self.production_capacity_units))
-        else:
-            # ===== NEW FIRM DECISION LOGIC =====
-            # Goal: Maximize revenue by selling ALL inventory (not just new production)
+        target_workers = max(current_workers, firm_config.min_target_workers)
+        planned_production_units = 0.0
 
-            # Step 1: Calculate how much we COULD produce with more workers
-            base_productivity = max(self.units_per_worker, 1.0)
-
-            # Step 2: Project revenue if we hire more workers
-            # "If I hire X more workers, they produce Y units, I sell at price P"
-            # Total units to sell = current inventory + new production
-            total_units_to_sell = self.inventory_units + capacity_for_workers(current_workers)
-
-            # Step 3: Estimate demand at current price
-            # Use recent sales as demand proxy (with some growth assumption)
-            estimated_demand_at_current_price = updated_expected_sales * 1.1  # Assume 10% growth potential
-
-            # Step 4: Check if we have excess inventory
-            inventory_ratio = self.inventory_units / max(updated_expected_sales, 1.0)
-            has_excess_inventory = inventory_ratio > 1.5  # More than 1.5 ticks of sales in stock
-
-            # Step 5: Decide hiring based on revenue projection
-            if has_excess_inventory:
-                # We have inventory piling up - focus on clearing it, not producing more
-                # Don't hire, but don't fire either (workers might be needed after clearance)
-                target_workers = current_workers
-                planned_production_units = capacity_for_workers(current_workers) * 0.5  # Reduce production
+        needs_bootstrap = (not self.is_baseline) and (current_workers < minimum_private_staff) and not self.burn_mode
+        if needs_bootstrap:
+            target_workers = minimum_private_staff
+            planned_hires = min(target_workers - current_workers, scaling_limit)
+            planned_production_units = min(
+                self._capacity_for_workers(target_workers),
+                self.production_capacity_units
+            )
+        elif self.burn_mode:
+            reduction_factor = firm_config.burn_mode_staff_reduction_factor
+            reduced_workers = int(math.ceil(max(1, current_workers) * reduction_factor))
+            target_workers = max(skeleton_min, reduced_workers)
+            idle_fraction = max(0.0, firm_config.burn_mode_idle_production_fraction)
+            if idle_fraction > 0:
+                planned_production_units = min(
+                    self._capacity_for_workers(target_workers),
+                    self.production_capacity_units * idle_fraction
+                )
             else:
-                # Inventory is reasonable - consider hiring
-                # Calculate marginal revenue from hiring one more worker
-                additional_units_from_hire = base_productivity * ((current_workers + 1) ** 0.9) - capacity_for_workers(current_workers)
-                marginal_revenue = additional_units_from_hire * self.price
-                marginal_cost = self.wage_offer
+                planned_production_units = 0.0
+        elif housing_market_saturated:
+            planned_production_units = 0.0
+            target_workers = max(skeleton_min, int(current_workers * 0.5))
+        elif self.is_baseline:
+            if in_warmup:
+                planned_hires = 1_000_000_000  # effectively infinite during warm-up
+                revenue_per_worker = self.price * self.productivity_per_worker
+                self.wage_offer = min(revenue_per_worker * 0.95, 40.0)
+                planned_production_units = min(
+                    self.production_capacity_units,
+                    max(self.baseline_production_quota, self.production_capacity_units)
+                )
+            else:
+                support_ratio = 0.6 if post_warmup_cooldown else 0.25
+                support_output = self.baseline_production_quota * support_ratio
+                target_output = min(
+                    self.production_capacity_units,
+                    max(support_output, expected_baseline * 0.8)
+                )
+                target_workers = self._workers_for_sales(target_output)
 
-                # Hire if marginal revenue > marginal cost
-                if marginal_revenue > marginal_cost:
-                    # Calculate how many workers we should hire
-                    # Target: Produce enough to meet projected demand
-                    target_production = min(estimated_demand_at_current_price, self.production_capacity_units)
-                    target_workers = workers_needed_for_output(target_production)
-                else:
-                    # Workers aren't profitable at current price - don't expand
-                    target_workers = current_workers
+                delta = target_workers - current_workers
+                if delta > 0:
+                    planned_hires = min(delta, scaling_limit)
+                elif delta < 0:
+                    layoff_count = min(-delta, scaling_limit)
+                    if layoff_count > 0:
+                        planned_layoffs = self.employees[:layoff_count]
 
                 planned_production_units = min(
-                    capacity_for_workers(max(current_workers, target_workers)),
-                    self.production_capacity_units
+                    self._capacity_for_workers(max(target_workers, firm_config.min_target_workers)),
+                    target_output
                 )
+        else:
+            additional_output = (
+                    self._capacity_for_workers(current_workers + 1) -
+                    self._capacity_for_workers(current_workers)
+                )
+            delta_profit = additional_output * self.price - effective_wage_cost
+            demand_target = self._workers_for_sales(min(expected_baseline, self.production_capacity_units))
+            profit_target = self._profit_optimal_workers(
+                max(current_workers, firm_config.min_target_workers),
+                expected_baseline,
+                effective_wage_cost
+            )
 
-            # Step 6: Execute hiring/firing decisions
+            if delta_profit <= 0:
+                target_workers = min(current_workers, profit_target)
+            else:
+                target_workers = min(demand_target, profit_target)
+                target_workers = max(target_workers, minimum_private_staff)
+
+            planned_production_units = min(
+                self._capacity_for_workers(max(current_workers, target_workers)),
+                self.production_capacity_units
+            )
+
+        target_workers = max(target_workers, demand_workers)
+
+        if (not self.is_baseline) and (not is_housing_producer):
+            target_workers = max(target_workers, current_workers + 1)
+
+        if self.loan_required_headcount > 0:
+            target_workers = max(target_workers, self.loan_required_headcount)
+
+        if not (self.is_baseline and in_warmup):
             delta = target_workers - current_workers
             if delta > 0:
                 planned_hires = min(delta, scaling_limit)
             elif delta < 0:
-                # Only fire if absolutely necessary (firm philosophy: avoid firing)
-                # Fire only if we have massive overcapacity (>200% of demand)
-                if inventory_ratio > 3.0:
-                    layoff_count = min(-delta, scaling_limit)
+                layoff_count = min(-delta, scaling_limit)
+                if layoff_count > 0:
                     planned_layoffs = self.employees[:layoff_count]
 
         self.planned_hires_count = planned_hires
@@ -1309,10 +1768,15 @@ class FirmAgent:
             "planned_production_units": planned_production_units,
             "planned_hires_count": planned_hires,
             "planned_layoffs_ids": planned_layoffs,
-            "updated_expected_sales": updated_expected_sales,  # include for later apply
+            "updated_expected_sales": self.expected_sales_units,  # include for later apply
         }
 
-    def plan_pricing(self, sell_through_rate: float, in_warmup: bool = False) -> Dict[str, float]:
+    def plan_pricing(
+        self,
+        sell_through_rate: float,
+        unemployment_rate: float,
+        in_warmup: bool = False
+    ) -> Dict[str, float]:
         """
         AGGRESSIVE INVENTORY CLEARANCE PRICING
 
@@ -1337,51 +1801,35 @@ class FirmAgent:
                 "markup_next": (target_price / self.unit_cost - 1.0) if self.unit_cost > 0 else self.markup,
             }
 
-        # Calculate inventory pressure (how much isn't selling)
-        average_weekly_sales = max(self.expected_sales_units * 7.0, 1e-3)
-        weeks_of_supply = self.inventory_units / average_weekly_sales
-        inventory_ratio = self.inventory_units / max(self.expected_sales_units, 1.0)
+        import random
 
-        # Calculate labor cost floor (can't price below what we pay workers)
-        current_workers = max(len(self.employees), 1)
-        total_wage_bill = current_workers * self.wage_offer
-        expected_production = self.units_per_worker * (current_workers ** 0.9)
-        labor_cost_per_unit = total_wage_bill / max(expected_production, 1.0)
-        absolute_floor = max(labor_cost_per_unit * 0.95, 0.01)  # 95% of labor cost or $0.01
+        capacity = self._capacity_for_workers(max(len(self.employees), 1))
+        sold_ratio = (self.last_units_sold / capacity) if capacity > 0 else 0.0
+        inv_ratio = self.inventory_units / max(1.0, self.expected_sales_units)
 
-        # AGGRESSIVE CLEARANCE PRICING
-        # If inventory is building up, cut price aggressively
-        if inventory_ratio > 3.0:
-            # Severe glut (>3 ticks of inventory) - FIRE SALE
-            # Cut price 30-50% to clear everything
-            price_next = self.price * 0.50
-        elif inventory_ratio > 2.0:
-            # Major glut (>2 ticks) - aggressive discounting
-            price_next = self.price * 0.70
-        elif inventory_ratio > 1.5:
-            # Moderate glut (>1.5 ticks) - significant discount
-            price_next = self.price * 0.85
-        elif inventory_ratio > 1.0:
-            # Slight glut (>1 tick) - small discount
-            price_next = self.price * 0.95
-        elif inventory_ratio < 0.5:
-            # Inventory too low - raise price to rebuild margin
-            price_next = self.price * 1.05
-        else:
-            # Inventory in good range - maintain price
-            price_next = self.price
+        up_factor = max(0.2, 1.0 - unemployment_rate)
+        down_factor = 1.0 + unemployment_rate
 
-        # Additional sell-through pressure
-        # If we're not selling even at reduced prices, cut more
-        if sell_through_rate < 0.1:
-            # Almost nothing selling - DESPERATE clearance
-            price_next *= 0.70
-        elif sell_through_rate < 0.5:
-            # Weak sales - more discounting
-            price_next *= 0.90
+        price_change = 1.0
 
-        # Absolute floor: Can't price below labor cost (would lose money on every sale)
-        price_next = max(price_next, absolute_floor)
+        # AGGRESSIVE INVENTORY LIQUIDATION LOGIC
+        # If inventory > 3× production rate: drastic price cuts (20-30% reduction)
+        if self.last_units_produced > 0 and self.inventory_units > 3.0 * self.last_units_produced:
+            price_change *= random.uniform(0.70, 0.80)  # 20-30% price cut
+
+        # If items sold < items produced: decrease price by random 0-5%
+        elif self.last_units_produced > 0 and self.last_units_sold < self.last_units_produced:
+            reduction = random.uniform(0.0, 0.05)
+            price_change *= (1.0 - reduction)
+
+        # Original pricing logic (for normal conditions)
+        elif sold_ratio < 0.3:
+            price_change *= (1.0 - 0.03 * down_factor)
+        elif sold_ratio > 0.8 and inv_ratio < 0.5:
+            price_change *= (1.0 + 0.02 * up_factor)
+
+        price_change = max(0.5, min(1.1, price_change))  # Allow deeper cuts (down to 50%)
+        price_next = max(self.min_price, self.price * price_change)
 
         # Calculate markup
         if self.unit_cost > 0:
@@ -1394,90 +1842,68 @@ class FirmAgent:
             "markup_next": markup_next,
         }
 
-    def plan_wage(self) -> Dict[str, float]:
-        """
-        Adjust wages based on revenue and hiring success.
-
-        NEW PHILOSOPHY - Wage cuts are LAST RESORT:
-        1. Firms prefer NOT to cut wages (bad for morale/retention)
-        2. First try: Lower prices to increase revenue
-        3. Second try: Reduce production (don't hire)
-        4. Last resort: Cut wages ONLY if revenue can't cover payroll at ANY price
-
-        WAGE CUT CONDITIONS:
-        - Revenue at rock-bottom prices (labor cost floor) still can't cover payroll
-        - Cash balance is negative (firm is insolvent)
-        - No other option except bankruptcy
-
-        Otherwise: Maintain or raise wages based on hiring success
-
-        Does not mutate state; returns a plan dict.
-
-        Returns:
-            Dict with wage_offer_next
-        """
+    def plan_wage(self, unemployment_rate: float = 0.0, unemployment_benefit: float = 0.0) -> Dict[str, float]:
+        firm_config = self._firm_config()
         if self.is_baseline and self.last_tick_planned_hires >= 1_000_000:
             return {"wage_offer_next": self.wage_offer}
 
-        # Calculate revenue per worker (value created by each worker)
-        current_workers = max(len(self.employees), 1)
+        expected_skill_premium = self._expected_skill_premium()
+        current_workers = max(len(self.employees), firm_config.min_target_workers)
 
-        # Revenue per worker = price × productivity (with diminishing returns)
-        base_productivity = max(self.units_per_worker, 1.0)
-        actual_productivity_per_worker = base_productivity * (current_workers ** -0.1)
-        revenue_per_worker = self.price * actual_productivity_per_worker
-
-        # Calculate total revenue and wage bill
-        total_wage_bill = current_workers * self.wage_offer
-        projected_production = base_productivity * (current_workers ** 0.9)
-        projected_revenue = projected_production * self.price
-
-        # Check if firm is in financial distress
-        revenue_covers_payroll = projected_revenue >= total_wage_bill
-        is_insolvent = self.cash_balance < -10000.0  # Deep in debt
-
-        # DECISION TREE:
-        if not revenue_covers_payroll and is_insolvent:
-            # CRISIS MODE: Revenue can't cover payroll even at current prices
-            # AND firm is insolvent
-            # Last resort: Cut wages by 10%
-            wage_offer_next = self.wage_offer * 0.90
-            wage_offer_next = max(wage_offer_next, 1.0)  # Floor at $1
+        if current_workers > 0 and self.last_revenue > 0:
+            realized_rev_per_worker = self.last_revenue / current_workers
         else:
-            # NORMAL MODE: Adjust wages based on hiring success and revenue
-            # Firms target paying workers 60-70% of revenue they generate
-            target_wage_share = 0.65
-            fundamental_wage = revenue_per_worker * target_wage_share
+            realized_rev_per_worker = self.price * self._productivity_per_worker(max(current_workers, 1))
 
-            # Adjust based on hiring pressure (if can't hire, raise wages)
-            if self.last_tick_planned_hires > 0:
-                hiring_denominator = max(self.last_tick_planned_hires, 1)
-                hiring_success = self.last_tick_actual_hires / hiring_denominator
+        margin = 0.0
+        if self.last_revenue > 0:
+            margin = self.last_profit / max(1.0, self.last_revenue)
 
-                if hiring_success < 0.5:
-                    # Desperate for workers - raise wages toward fundamental value
-                    adjustment = 1.0 + (0.1 * (1.0 - hiring_success))
-                elif hiring_success < 1.0:
-                    # Moderate hiring difficulty - small wage increase
-                    adjustment = 1.0 + (0.05 * (1.0 - hiring_success))
-                else:
-                    # Hired everyone we wanted - can lower wages slightly
-                    adjustment = 0.98
-            else:
-                # Not hiring - gradually drift toward fundamental wage
-                adjustment = 0.99
+        slack_factor = max(0.2, 1.0 - unemployment_rate)
+        fundamental_wage = realized_rev_per_worker * firm_config.target_labor_share * slack_factor
+        wage_offer_next = self.wage_offer
+        raise_damp = max(0.2, 1.0 - 0.8 * unemployment_rate)
+        floor_wage = max(firm_config.minimum_wage_floor, unemployment_benefit * 1.5)
 
-            # Blend current wage with fundamental wage (smooth adjustment)
-            wage_offer_next = self.wage_offer * adjustment
-            wage_offer_next = 0.7 * wage_offer_next + 0.3 * fundamental_wage
+        if self.last_revenue <= 1e-3:
+            wage_target = min(self.wage_offer, max(floor_wage, fundamental_wage))
+            wage_offer_next = 0.9 * self.wage_offer + 0.1 * wage_target
+        elif margin <= 0.0:
+            wage_target = min(self.wage_offer, fundamental_wage)
+            wage_offer_next = 0.9 * self.wage_offer + 0.1 * wage_target
+        elif margin < firm_config.margin_low:
+            wage_offer_next = 0.95 * self.wage_offer + 0.05 * fundamental_wage
+        elif margin < firm_config.margin_high:
+            wage_target = 0.9 * self.wage_offer + 0.1 * fundamental_wage
+            wage_offer_next = self.wage_offer + (wage_target - self.wage_offer) * raise_damp
+        else:
+            wage_target = 0.8 * self.wage_offer + 0.2 * fundamental_wage
+            wage_offer_next = self.wage_offer + (wage_target - self.wage_offer) * raise_damp
 
-            # Floor: wage must be at least $1
-            # Ceiling: wage cannot exceed 90% of revenue per worker (firm needs profit)
-            wage_offer_next = max(1.0, min(wage_offer_next, revenue_per_worker * 0.90))
+        max_increase = self.wage_offer * 1.15
+        max_decrease = self.wage_offer * 0.85
+        wage_offer_next = max(max_decrease, min(max_increase, wage_offer_next))
 
-        return {
-            "wage_offer_next": wage_offer_next,
-        }
+        wage_offer_next = max(floor_wage, wage_offer_next)
+
+        if realized_rev_per_worker > 0:
+            max_wage = firm_config.max_labor_share * realized_rev_per_worker
+            wage_offer_next = min(wage_offer_next, max_wage)
+
+            min_wage = firm_config.min_labor_share * realized_rev_per_worker
+            if wage_offer_next < min_wage and margin > firm_config.margin_low:
+                wage_offer_next = min(max_wage, max(min_wage, wage_offer_next))
+
+        if self.last_revenue <= 1e-3:
+            wage_offer_next = min(wage_offer_next, self.wage_offer)
+
+        if self.cash_balance <= 0.0:
+            wage_offer_next = max(floor_wage, wage_offer_next * 0.95)
+
+        if not self.is_baseline and len(self.employees) == 0:
+            wage_offer_next = min(wage_offer_next, 40.0)
+
+        return {"wage_offer_next": wage_offer_next}
 
     def apply_labor_outcome(self, outcome: Dict[str, object]) -> None:
         """
@@ -1506,6 +1932,16 @@ class FirmAgent:
                 self.employees.append(worker_id)
             self.actual_wages[worker_id] = wage_map.get(worker_id, self.wage_offer)
 
+        # FIX: Update existing workers' wages to meet minimum wage floor
+        # This prevents grandfathering of old low wages
+        # Minimum wage is set at firm level via wage_offer enforcement
+        # But we also need to ensure actual_wages dict is updated
+        for worker_id in self.employees:
+            if worker_id in self.actual_wages:
+                # Ensure existing workers get at least the current wage_offer
+                # (which has minimum wage floor already enforced)
+                self.actual_wages[worker_id] = max(self.actual_wages[worker_id], self.wage_offer)
+
         # Track hiring for next planning cycle
         # Note: These should be set from the plan, but we update actual hires here
         self.last_tick_actual_hires = len(hired_households_ids)
@@ -1521,6 +1957,9 @@ class FirmAgent:
         """
         realized_production_units = result.get("realized_production_units", 0.0)
         other_variable_costs = result.get("other_variable_costs", 0.0)
+
+        # Track production for pricing decisions
+        self.last_units_produced = realized_production_units
 
         # Update inventory
         self.inventory_units += realized_production_units
@@ -1567,8 +2006,52 @@ class FirmAgent:
         self.cash_balance += revenue
         self.cash_balance -= profit_taxes_paid
 
+        self.last_units_sold = units_sold
+        self.last_revenue = revenue
+        profit = revenue - profit_taxes_paid - self.last_tick_total_costs
+        self.last_profit = profit
         # Track net profit for dividend policy
-        self.net_profit = revenue - profit_taxes_paid - self.last_tick_total_costs
+        self.net_profit = profit
+
+        if self.cash_balance <= 0.0:
+            self.zero_cash_streak += 1
+        else:
+            self.zero_cash_streak = 0
+
+        # Adjust wages if they exceed 80% of revenue
+        self.adjust_wages_to_revenue_ratio(revenue)
+
+    def adjust_wages_to_revenue_ratio(self, revenue: float) -> None:
+        """
+        Adjust wages if wage bill exceeds 80% of revenue.
+
+        Firms target 70-80% of revenue as wages. If wages exceed 80% of revenue,
+        reduce all wages by 10% (floored at minimum wage of $20).
+
+        Args:
+            revenue: Revenue from this tick
+        """
+        if revenue <= 0 or not self.employees:
+            return
+
+        # Calculate current wage bill
+        wage_bill = 0.0
+        for employee_id in self.employees:
+            wage_bill += self.actual_wages.get(employee_id, self.wage_offer)
+
+        # Check if wages exceed 80% of revenue
+        wage_ratio = wage_bill / revenue
+        if wage_ratio > 0.80:
+            # Reduce all wages by 10%, floored at minimum wage
+            minimum_wage = 20.0
+            for employee_id in self.employees:
+                current_wage = self.actual_wages.get(employee_id, self.wage_offer)
+                reduced_wage = current_wage * 0.9  # 10% reduction
+                new_wage = max(reduced_wage, minimum_wage)
+                self.actual_wages[employee_id] = new_wage
+
+            # Also reduce wage_offer for new hires
+            self.wage_offer = max(self.wage_offer * 0.9, minimum_wage)
 
     def apply_price_and_wage_updates(
         self,
@@ -1602,7 +2085,53 @@ class FirmAgent:
         """
         self.expected_sales_units = updated_expected_sales
 
-    def apply_rd_and_quality_update(self, revenue: float) -> None:
+    def invest_in_unit_expansion(self) -> bool:
+        """
+        Housing firms can invest in adding more rental units.
+
+        INVESTMENT RULES:
+        - Only housing firms can do this
+        - Cost increases with each additional unit (diminishing returns)
+        - Base cost: $15,000 per unit
+        - Cost multiplier: 1.2 ^ (current_units / 10)
+        - Firm must have at least 2x the cost in cash
+
+        Returns:
+            True if investment was made, False otherwise
+
+        Mutates state.
+        """
+        if self.good_category != "Housing":
+            return False
+
+        # Check if we should expand (high occupancy rate)
+        occupancy_rate = len(self.current_tenants) / max(self.max_rental_units, 1)
+
+        if occupancy_rate < 0.85:
+            # Not enough demand to justify expansion
+            return False
+
+        # Calculate cost with diminishing returns
+        base_cost = 15000.0
+        cost_multiplier = 1.2 ** (self.max_rental_units / 10.0)
+        total_cost = base_cost * cost_multiplier
+
+        # Check if firm can afford it (needs 2x the cost in cash)
+        if self.cash_balance < total_cost * 2.0:
+            return False
+
+        # Make the investment
+        self.cash_balance -= total_cost
+        self.max_rental_units += 1
+        self.production_capacity_units += 1.0
+        self.expected_sales_units += 1.0
+
+        # Property tax increases slightly
+        self.property_tax_rate += 0.005  # +0.5% per new unit
+
+        return True
+
+    def apply_rd_and_quality_update(self, revenue: float) -> float:
         """
         Invest in R&D and update quality level.
 
@@ -1610,9 +2139,20 @@ class FirmAgent:
 
         Args:
             revenue: Revenue from this tick (used to compute R&D spending)
+
+        Returns:
+            Amount spent on R&D (to be redirected to Misc firm)
         """
+        # Increase R&D when sales are poor (items sold < items produced)
+        # This encourages quality improvement to boost sales
+        if self.last_units_produced > 0 and self.last_units_sold < self.last_units_produced:
+            # Boost R&D spending by 20-30% when underselling
+            rd_rate = min(0.15, self.rd_spending_rate * 1.25)  # Cap at 15% of revenue
+        else:
+            rd_rate = self.rd_spending_rate
+
         # Compute R&D spending
-        rd_spending = revenue * self.rd_spending_rate
+        rd_spending = revenue * rd_rate
         self.accumulated_rd_investment += rd_spending
 
         # Deduct R&D spending from cash
@@ -1629,6 +2169,8 @@ class FirmAgent:
             0.0,
             min(10.0, self.quality_level + quality_gain - quality_loss)
         )
+
+        return rd_spending
 
     def distribute_profits(self, household_lookup: Dict[int, 'HouseholdAgent']) -> float:
         """
@@ -1677,7 +2219,7 @@ class FirmAgent:
         return total_distributed
 
 
-@dataclass
+@dataclass(slots=True)
 class GovernmentAgent:
     """
     Represents a government in the economic simulation.
@@ -1693,6 +2235,7 @@ class GovernmentAgent:
     # Policy parameters
     wage_tax_rate: float = 0.15  # [0,1]
     profit_tax_rate: float = 0.20  # [0,1]
+    investment_tax_rate: float = 0.10  # [0,1] - Tax on R&D and investments
     unemployment_benefit_level: float = 30.0  # per-tick payment to unemployed
     min_cash_threshold: float = 100.0  # safety net threshold
     transfer_budget: float = 10000.0  # max total transfers per tick
@@ -1785,6 +2328,23 @@ class GovernmentAgent:
             Unemployment benefit amount per tick
         """
         return self.unemployment_benefit_level
+
+    def get_minimum_wage(self) -> float:
+        """
+        Calculate the minimum wage floor based on unemployment benefit.
+
+        Minimum wage = unemployment_benefit × wage_floor_multiplier
+        Default multiplier is 1.2, so minimum wage is 20% above unemployment benefit.
+
+        This prevents situations where firms pay 1 worker $400 instead of
+        hiring 5 workers at $80 each, and ensures jobs are worthwhile vs. unemployment.
+
+        Returns:
+            Minimum wage that firms must pay
+        """
+        # Default multiplier if config not available
+        multiplier = 1.2
+        return self.unemployment_benefit_level * multiplier
 
     def plan_transfers(self, households: List[Dict[str, object]]) -> Dict[int, float]:
         """
@@ -1907,36 +2467,104 @@ class GovernmentAgent:
 
             wage_taxes[household_id] = max(wage_income * rate, 0.0)
 
-        # Profit tax with oligarchy surcharge based on cash concentration
-        firm_cash = [f.get("cash_balance", 0.0) for f in firms]
-        oligarchy = False
-        cash_threshold = 0.0
-        if firm_cash:
-            firm_cash_sorted = sorted(firm_cash)
-            cash_threshold = firm_cash_sorted[int(0.9 * (len(firm_cash_sorted) - 1))]
-            top_sum = sum(c for c in firm_cash if c >= cash_threshold)
-            total_sum = sum(firm_cash) or 1.0
-            oligarchy = (top_sum / total_sum) > 0.5
+        # WEALTH-BASED PROGRESSIVE TAXATION FOR FIRMS
+        # Use quartiles of firm cash balance to determine tax brackets
+        # This ensures consistent progressive taxation regardless of absolute wealth levels
 
+        firm_cash = [f.get("cash_balance", 0.0) for f in firms]
+
+        if firm_cash and len(firm_cash) >= 4:
+            firm_cash_sorted = sorted(firm_cash)
+            n = len(firm_cash_sorted)
+
+            # Calculate percentile thresholds
+            q1 = firm_cash_sorted[int(0.25 * (n - 1))]  # 25th percentile (poor)
+            q2 = firm_cash_sorted[int(0.50 * (n - 1))]  # 50th percentile (average)
+            q3 = firm_cash_sorted[int(0.75 * (n - 1))]  # 75th percentile (rich)
+            p90 = firm_cash_sorted[int(0.90 * (n - 1))]  # 90th percentile (very rich)
+            p99 = firm_cash_sorted[int(0.99 * (n - 1))]  # 99th percentile (ultra rich - TOP 1%)
+
+            # Initialize random tax rate modifiers (deterministic per simulation)
+            import random
+            rng = random.Random(54321)  # Fixed seed for consistency
+
+            # Base profit tax rate (for average firms in Q2-Q3 range)
+            base_rate = self.profit_tax_rate
+
+            # Random additional tax for each bracket
+            # Top 1%: base + (20-35% extra) - MASSIVE wealth tax on ultra-rich
+            top_1_extra = rng.uniform(0.20, 0.35)
+            top_1_rate = min(0.60, base_rate + top_1_extra)  # Cap at 60%
+
+            # Very rich (top 10%): base + (10-20% extra)
+            very_rich_extra = rng.uniform(0.10, 0.20)
+            very_rich_rate = base_rate + very_rich_extra
+
+            # Rich (top 25%): base + (5% to very_rich_extra - 1%)
+            rich_extra = rng.uniform(0.05, max(0.06, very_rich_extra - 0.01))
+            rich_rate = base_rate + rich_extra
+
+            # Average: base rate (Q2-Q3)
+            average_rate = base_rate
+
+            # Poor: base - (0-5%)
+            poor_discount = rng.uniform(0.0, 0.05)
+            poor_rate = max(0.01, base_rate - poor_discount)
+        else:
+            # Not enough firms for quartiles, use base rate
+            q1 = q2 = q3 = p90 = p99 = 0.0
+            poor_rate = average_rate = rich_rate = very_rich_rate = top_1_rate = self.profit_tax_rate
+
+        # Apply wealth-based tax rates to each firm
         for firm in firms:
             firm_id = firm["firm_id"]
             profit_before_tax = firm.get("profit_before_tax", 0.0)
-            base_tax = max(profit_before_tax * self.profit_tax_rate, 0.0)
-            surcharge = 0.0
-            if oligarchy and firm.get("cash_balance", 0.0) >= cash_threshold:
-                surcharge = base_tax * 0.1
-            profit_taxes[firm_id] = base_tax + surcharge
+            cash_balance = firm.get("cash_balance", 0.0)
+
+            # Determine tax rate based on wealth percentile
+            if cash_balance <= q1:
+                # Poor firms (bottom 25%)
+                rate = poor_rate
+            elif cash_balance <= q2:
+                # Below average firms (25-50%)
+                rate = average_rate * 0.9  # Slight discount
+            elif cash_balance <= q3:
+                # Above average firms (50-75%)
+                rate = average_rate
+            elif cash_balance <= p90:
+                # Rich firms (75-90%)
+                rate = rich_rate
+            elif cash_balance <= p99:
+                # Very rich firms (90-99%)
+                rate = very_rich_rate
+            else:
+                # TOP 1% - Ultra rich firms get hit with massive wealth tax
+                rate = top_1_rate
+
+            # Calculate total profit tax
+            profit_taxes[firm_id] = max(profit_before_tax * rate, 0.0)
+
+        # Calculate property taxes for housing firms
+        property_taxes = {}
+        for firm in firms:
+            firm_id = firm["firm_id"]
+            if firm.get("good_category") == "Housing" and firm.get("property_tax_rate", 0.0) > 0:
+                # Property tax is annual rate, so divide by 52 for weekly payment
+                weekly_property_tax = firm["property_tax_rate"] * firm["cash_balance"] / 52.0
+                property_taxes[firm_id] = max(weekly_property_tax, 0.0)
 
         return {
             "wage_taxes": wage_taxes,
             "profit_taxes": profit_taxes,
+            "property_taxes": property_taxes,
         }
 
     def apply_fiscal_results(
         self,
         total_wage_taxes: float,
         total_profit_taxes: float,
-        total_transfers: float
+        total_transfers: float,
+        total_property_taxes: float = 0.0
     ) -> None:
         """
         Update government cash based on fiscal operations.
@@ -1947,15 +2575,17 @@ class GovernmentAgent:
             total_wage_taxes: Sum of all wage taxes collected
             total_profit_taxes: Sum of all profit taxes collected
             total_transfers: Sum of all transfers paid out
+            total_property_taxes: Sum of all property taxes collected (from housing firms)
         """
         # Collect taxes
         self.cash_balance += total_wage_taxes
         self.cash_balance += total_profit_taxes
+        self.cash_balance += total_property_taxes
 
         # Pay transfers
         self.cash_balance -= total_transfers
 
-    def adjust_policies(self, unemployment_rate: float, inflation_rate: float, deficit_ratio: float, num_unemployed: int = 0) -> None:
+    def adjust_policies(self, unemployment_rate: float, inflation_rate: float, deficit_ratio: float, num_unemployed: int = 0, gdp: float = 0.0, total_tax_revenue: float = 0.0, num_bankrupt_firms: int = 0) -> None:
         """
         Dynamically adjust government policies based on economic conditions.
 
@@ -1985,24 +2615,26 @@ class GovernmentAgent:
             # Can reduce benefits slightly during boom
             self.unemployment_benefit_level = max(20.0, self.unemployment_benefit_level * 0.99)
 
-        # REALISTIC DEFICIT TOLERANCE
-        # Governments can run deficits, but must address them if debt becomes unsustainable
-        # In real life, deficits of 3-5% of GDP are normal; >10% requires action
+        # Dynamic tax policy based on cash flow and GDP
+        from config import CONFIG
+        gov_cfg = CONFIG.government
 
-        # Only raise taxes if deficit is EXTREME (not just negative)
-        # Assume deficit_ratio is calculated as abs(gov_cash) / GDP
-        if self.cash_balance < -50000000.0:  # Catastrophic deficit (>$50M)
-            # Crisis mode - increase taxes aggressively
-            self.wage_tax_rate = min(0.35, self.wage_tax_rate * 1.05)
-            self.profit_tax_rate = min(0.40, self.profit_tax_rate * 1.05)
-        elif self.cash_balance < -10000000.0:  # Large deficit (>$10M)
-            # Moderate tax increases
-            self.wage_tax_rate = min(0.30, self.wage_tax_rate * 1.02)
-            self.profit_tax_rate = min(0.35, self.profit_tax_rate * 1.02)
-        elif self.cash_balance > 50000000.0:  # Large surplus (>$50M)
-            # Return surplus to economy via tax cuts
-            self.wage_tax_rate = max(0.05, self.wage_tax_rate * 0.98)
-            self.profit_tax_rate = max(0.10, self.profit_tax_rate * 0.98)
+        if gdp > 0.0 and total_tax_revenue < -gdp:
+            rng = random.Random(777)
+            bump = rng.uniform(0.0, 0.08)
+            self.wage_tax_rate = min(gov_cfg.deficit_wage_tax_max, self.wage_tax_rate * (1.0 + bump))
+            self.profit_tax_rate = min(gov_cfg.deficit_profit_tax_max, self.profit_tax_rate * (1.0 + bump))
+        elif self.cash_balance > 0.0:
+            rng = random.Random(778)
+            cut = rng.uniform(0.0, 0.08)
+            self.wage_tax_rate = max(gov_cfg.surplus_wage_tax_min, self.wage_tax_rate * (1.0 - cut))
+            self.profit_tax_rate = max(gov_cfg.surplus_profit_tax_min, self.profit_tax_rate * (1.0 - cut))
+
+        if num_bankrupt_firms > 0:
+            rng = random.Random(779)
+            relief = rng.uniform(0.0, 0.04)
+            self.wage_tax_rate = max(gov_cfg.surplus_wage_tax_min, self.wage_tax_rate * (1.0 - relief))
+            self.profit_tax_rate = max(gov_cfg.surplus_profit_tax_min, self.profit_tax_rate * (1.0 - relief))
 
         # DYNAMIC TRANSFER BUDGET (scales with unemployment)
         # Real governments don't have fixed transfer budgets - spending rises during recessions
@@ -2091,26 +2723,34 @@ class GovernmentAgent:
 
     def make_investments(self) -> Dict[str, float]:
         """
-        Execute all government investments if cash is available.
+        Government bond purchases with surplus funds (removed infrastructure/social programs).
 
-        This should be called each tick to allow government to invest
-        surplus funds into the economy.
+        When government has surplus, it purchases bonds from Misc firm,
+        which distributes the money to households (1 person per tick).
 
         Mutates state.
 
         Returns:
-            Dict with investment amounts for each category
+            Dict with "bonds" key containing amount spent on bond purchases
         """
-        investments = {
-            "infrastructure": 0.0,
-            "technology": 0.0,
-            "social": 0.0,
-        }
+        investments = {"bonds": 0.0}
 
-        # Only invest if government has surplus (positive cash balance)
-        if self.cash_balance > 10000.0:  # Keep some reserve
-            investments["infrastructure"] = self.invest_in_infrastructure()
-            investments["technology"] = self.invest_in_technology()
-            investments["social"] = self.invest_in_social_programs()
+        # Define surplus threshold as percentage of cash balance
+        surplus_threshold_pct = 0.20  # Consider 20%+ above baseline as surplus
+        baseline_reserve = 50000.0  # Minimum reserve to maintain
+
+        # Calculate surplus (scaled, not fixed)
+        if self.cash_balance < baseline_reserve:
+            return investments
+
+        surplus = max(0.0, self.cash_balance - baseline_reserve)
+
+        # Spend 10-15% of surplus on bonds each tick (scaled)
+        if surplus > baseline_reserve * surplus_threshold_pct:
+            bond_purchase_rate = 0.12  # 12% of surplus per tick
+            bond_spend = surplus * bond_purchase_rate
+
+            self.cash_balance -= bond_spend
+            investments["bonds"] = bond_spend
 
         return investments
