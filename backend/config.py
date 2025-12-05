@@ -126,7 +126,7 @@ class HouseholdBehaviorConfig:
     min_quantity_scale: float = 0.15
 
     # Wellbeing Dynamics
-    happiness_decay_rate: float = 0.01
+    happiness_decay_rate: float = 0.002  # Reduced from 0.01 to prevent 0% happiness
     morale_decay_rate: float = 0.02
     health_decay_rate: float = 0.005
 
@@ -441,6 +441,15 @@ class DebugConfig:
 
 
 @dataclass
+class SimulationModeConfig:
+    """Feature toggles for experimentation."""
+    stabilization_enabled: bool = True
+    household_stabilizers: bool = True
+    firm_stabilizers: bool = True
+    government_stabilizers: bool = True
+
+
+@dataclass
 class SimulationConfig:
     """Master configuration for the entire simulation."""
 
@@ -452,6 +461,7 @@ class SimulationConfig:
     labor_market: LaborMarketConfig = field(default_factory=LaborMarketConfig)
     market: MarketMechanicsConfig = field(default_factory=MarketMechanicsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    modes: SimulationModeConfig = field(default_factory=SimulationModeConfig)
 
     # Simulation Scale (Legacy - kept for backward compatibility)
     num_households: int = 10000
